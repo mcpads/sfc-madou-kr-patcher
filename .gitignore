@@ -1,0 +1,12 @@
+/target
+tools/asar
+roms/
+out/
+translations/
+*.pyc
+*.sfc
+__pycache__/
+.DS_Store
+extract.txt
+.claude/
+.worktrees/
