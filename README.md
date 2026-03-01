@@ -1,4 +1,4 @@
-# sfc-madou-kr-patch
+# sfc-madou-kr-patcher
 
 SNES **마도물어: 하나마루 대유치원아** (Madou Monogatari: Hanamaru Daiyouchienji, 1996)의 한글 패치 코드베이스.
 
