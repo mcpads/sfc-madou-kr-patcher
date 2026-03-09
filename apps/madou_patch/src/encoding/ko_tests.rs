@@ -287,10 +287,10 @@ fn encode_simple_basic() {
 }
 
 #[test]
-fn encode_simple_space_is_zero() {
+fn encode_simple_space_is_blank_render() {
     let ko = test_ko_table();
     let result = encode_simple(" ", &ko).unwrap();
-    assert_eq!(result, vec![0x00]); // raw space, not BLANK_RENDER
+    assert_eq!(result, vec![0x18]); // BLANK_RENDER — writes zeros to VRAM
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn encode_box_resets_after_page() {
 fn encode_special_chars_simple() {
     let table = HashMap::new();
     let result = encode_simple(" \n.0129", &table).unwrap();
-    assert_eq!(result, vec![0x00, 0xF9, 0x0D, 0x01, 0x02, 0x03, 0x0A]);
+    assert_eq!(result, vec![0x18, 0xF9, 0x0D, 0x01, 0x02, 0x03, 0x0A]);
 }
 
 #[test]

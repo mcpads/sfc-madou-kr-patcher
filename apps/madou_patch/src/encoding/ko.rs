@@ -280,9 +280,11 @@ pub fn encode_ko_string_ff(
 
 // ── Simple encoding for encyclopedia descriptions ────────────────
 
-/// Simple encoder for encyclopedia descriptions.
+/// Simple encoder for encyclopedia descriptions, item names, and code patches.
 /// No control tags, no line padding.
-/// Space maps to 0x00 (raw space byte), not BLANK_RENDER.
+/// Space maps to 0x18 (BLANK_RENDER), which writes zeros to VRAM.
+/// Note: 0x00 was previously used but it acts as a string terminator in the
+/// game's item name renderer, causing names like "빛의 물방울" to be truncated.
 pub fn encode_simple(text: &str, ko_table: &HashMap<char, Vec<u8>>) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     let mut chars = text.chars().peekable();
@@ -298,7 +300,7 @@ pub fn encode_simple(text: &str, ko_table: &HashMap<char, Vec<u8>>) -> Result<Ve
                 result.push(byte);
             }
             '\n' => result.push(0xF9),
-            ' ' => result.push(0x00),
+            ' ' => result.push(BLANK_RENDER),
             '!' | '\u{FF01}' => result.push(0x0B),
             '?' | '\u{FF1F}' => result.push(0x0E),
             '.' => result.push(0x0D),
