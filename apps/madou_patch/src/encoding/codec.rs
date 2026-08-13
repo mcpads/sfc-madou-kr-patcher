@@ -48,6 +48,18 @@ pub fn speaker_name(id: u8) -> &'static str {
 
 /// Decode a raw byte stream into tokens using JP encoding.
 pub fn decode_jp(data: &[u8]) -> Vec<Token> {
+    decode(data, false)
+}
+
+/// Decode an encoded KO stream for layout simulation.
+///
+/// KO uses F1/F0 as two-byte glyph prefixes. JP uses those same byte values as
+/// ordinary single-byte kanji, so this must stay separate from `decode_jp`.
+pub fn decode_ko_layout(data: &[u8]) -> Vec<Token> {
+    decode(data, true)
+}
+
+fn decode(data: &[u8], ko_extended_prefixes: bool) -> Vec<Token> {
     let table = jp::build_decode_table();
     let fb_table = jp::build_fb_decode_table();
     let mut tokens = Vec::new();
@@ -87,6 +99,15 @@ pub fn decode_jp(data: &[u8]) -> Vec<Token> {
                 tokens.push(Token::Control(ControlCode::Separator));
                 i += 1;
             }
+            0xF0 | 0xF1 if ko_extended_prefixes => {
+                let prefix = b;
+                i += 1;
+                if i < data.len() {
+                    let idx = data[i];
+                    i += 1;
+                    tokens.push(Token::Char(GameChar::Prefixed(prefix, idx), '\u{FFFD}'));
+                }
+            }
             0xFB => {
                 i += 1;
                 if i < data.len() {
@@ -97,22 +118,6 @@ pub fn decode_jp(data: &[u8]) -> Vec<Token> {
                     } else {
                         tokens.push(Token::UnknownFb(idx));
                     }
-                }
-            }
-            0xF1 => {
-                i += 1;
-                if i < data.len() {
-                    let idx = data[i];
-                    i += 1;
-                    tokens.push(Token::Char(GameChar::Prefixed(0xF1, idx), '\u{FFFD}'));
-                }
-            }
-            0xF0 => {
-                i += 1;
-                if i < data.len() {
-                    let idx = data[i];
-                    i += 1;
-                    tokens.push(Token::Char(GameChar::Prefixed(0xF0, idx), '\u{FFFD}'));
                 }
             }
             0x00 => {

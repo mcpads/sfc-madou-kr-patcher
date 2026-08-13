@@ -3,10 +3,12 @@
 //! Loads chunked `bank_{id}_{NN}.json` files, `encyclopedia.json`,
 //! and `code_patches.json` as replacements for the legacy TSV format.
 
-use crate::encoding::ko;
+use crate::encoding::{codec, ko};
 use crate::patch::encyclopedia::EncyclopediaData;
 use crate::patch::translation::TranslationEntry;
 use crate::rom::SnesAddr;
+use crate::text::control;
+use crate::textbox::layout;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,6 +111,37 @@ pub fn load_bank_json_chunks(
                     e
                 )
             })?;
+
+            if let Some(profile) = control::fixed_text_box_profile(addr.bank, addr.addr) {
+                let tokens = codec::decode_ko_layout(&encoded);
+                let render = layout::render_pages_with_profile(&tokens, profile);
+                if render.overflow {
+                    let max_width = render
+                        .pages
+                        .iter()
+                        .flat_map(|page| page.lines.iter())
+                        .map(|line| line.width)
+                        .max()
+                        .unwrap_or(0);
+                    let max_lines = render
+                        .pages
+                        .iter()
+                        .map(|page| page.lines.len())
+                        .max()
+                        .unwrap_or(0);
+                    return Err(format!(
+                        "{}[{}]: Fixed text box overflow at {}: width {} tiles, {} lines \
+                         (limit {} tiles × {} lines)",
+                        file_path.display(),
+                        i,
+                        entry.addr,
+                        max_width,
+                        max_lines,
+                        profile.max_width_tiles,
+                        profile.max_lines
+                    ));
+                }
+            }
 
             entries.push(TranslationEntry { addr, encoded });
         }
@@ -236,6 +269,8 @@ pub struct CodePatchJsonEntry {
     pub slot_size: usize,
     #[serde(default)]
     pub prefix_bytes: String,
+    #[serde(default)]
+    pub jp: String,
     pub ko: String,
     #[serde(default)]
     pub notes: String,

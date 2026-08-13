@@ -1,4 +1,4 @@
-//! Save menu UI localization .
+//! Save menu UI localization (Issue E).
 //!
 //! The save menu displays screen titles (はじめるよ, うつすよ, けすよ) and button
 //! labels as LZ-compressed 8×8 tile graphics, not through the text engine.
@@ -26,11 +26,11 @@
 //! ```
 
 use crate::font_gen;
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{compile_jsl, compile_machine_code, ExecutionMode, Inst, MachineCode};
 use crate::patch::font;
 use crate::patch::hook_common::{self, JSL_LZ_BYTES};
 use crate::patch::tracked_rom::{Expect, TrackedRom};
-use crate::rom::lorom_to_pc;
+use crate::rom::{lorom_to_pc, pc_to_lorom};
 
 // ── Hook sites (Bank $02, `JSL $009440`) ───────────────────────────
 
@@ -68,7 +68,7 @@ const TILE_8X8_SIZE: usize = 16; // 8×8 2bpp = 16 bytes
 // ── KO character tile mappings ─────────────────────────────────────
 //
 // Each 16×16 character uses 4 CHR tile indices: [TL, TR, BL, BR].
-// JP tile index assignments come from JP ROM analysis.
+// JP tile index assignments come from HITL-verified JP ROM analysis.
 //
 // Title 1: はじめるよ → 시작할게요
 // Title 2: うつすよ   → 복사해요
@@ -430,12 +430,13 @@ fn resolve_tilemap_conflicts(tilemap: &mut [u8], ct: &ConflictTiles) -> usize {
 // ── DMA hook code ──────────────────────────────────────────────────
 
 /// Assemble a single DMA hook: ROM → WRAM via DMA channel 5.
-fn build_dma_hook(
+fn build_dma_hook_at(
+    code_addr: u16,
     wram: (u8, u8, u8),
     src_bank: u8,
     src_addr: u16,
     size: u16,
-) -> Result<Vec<u8>, String> {
+) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         Sep(0x20), // 8-bit A
@@ -468,7 +469,18 @@ fn build_dma_hook(
         StaAbs(0x420B),
         Rtl,
     ];
-    assemble(&program)
+    compile_machine_code(program, DATA_BANK, code_addr, ExecutionMode::M8X16)
+}
+
+#[cfg(test)]
+fn build_dma_hook(
+    wram: (u8, u8, u8),
+    src_bank: u8,
+    src_addr: u16,
+    size: u16,
+) -> Result<Vec<u8>, String> {
+    build_dma_hook_at(CODE_BASE_ADDR, wram, src_bank, src_addr, size)
+        .map(|code| code.bytes().to_vec())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────
@@ -601,10 +613,10 @@ fn write_bank19_data(
     ];
 
     // First pass: compute data addresses
-    let mut hook_codes: Vec<Vec<u8>> = Vec::new();
+    let mut hook_codes: Vec<MachineCode> = Vec::new();
     let mut code_offset = CODE_BASE_ADDR;
     for _ in &hooks_info {
-        let dummy = build_dma_hook((0, 0, 0), 0, 0, 0)?;
+        let dummy = build_dma_hook_at(code_offset, (0, 0, 0), 0, 0, 0)?;
         let hook_len = dummy.len() as u16;
         code_offset += hook_len;
         hook_codes.push(dummy);
@@ -646,55 +658,46 @@ fn write_bank19_data(
     let mut hook_addrs: Vec<u32> = Vec::new();
     for (i, (wram, _, _)) in hooks_info.iter().enumerate() {
         let (src_bank, src_addr, size) = data_addrs[i];
-        let hook = build_dma_hook(*wram, src_bank, src_addr, size)?;
+        let hook = build_dma_hook_at(code_addr, *wram, src_bank, src_addr, size)?;
         hook_addrs.push((DATA_BANK as u32) << 16 | code_addr as u32);
         code_addr += hook.len() as u16;
         hook_codes.push(hook);
     }
 
-    // Write hook code + data to ROM using a single region
-    {
-        let mut r = rom.region_expect(
-            base_pc,
-            total_size,
-            "savemenu:bank19_data",
+    // Write typed hooks and their payloads as separate owners.
+    for (index, hook) in hook_codes.iter().enumerate() {
+        rom.write_machine_code_expect(
+            hook,
+            &format!("savemenu:dma_hook_{index}"),
             &Expect::FreeSpace(0xFF),
         );
-        let mut write_off = 0;
-        for hook in &hook_codes {
-            r.copy_at(write_off, hook);
-            write_off += hook.len();
-        }
-        for (i, (_, data, desc)) in hooks_info.iter().enumerate() {
-            let (_, addr, _) = data_addrs[i];
-            let off = (addr - CODE_BASE_ADDR) as usize;
-            r.copy_at(off, data);
-            println!(
-                "  {} → ${:02X}:${:04X} (PC 0x{:05X}, {} bytes)",
-                desc,
-                DATA_BANK,
-                addr,
-                base_pc + off,
-                data.len()
-            );
-        }
+    }
+    for (i, (_, data, desc)) in hooks_info.iter().enumerate() {
+        let (_, addr, _) = data_addrs[i];
+        let off = (addr - CODE_BASE_ADDR) as usize;
+        rom.write_snes_expect(
+            DATA_BANK,
+            addr,
+            data,
+            &format!("savemenu:data_{i}"),
+            &Expect::FreeSpace(0xFF),
+        );
+        println!(
+            "  {} → ${:02X}:${:04X} (PC 0x{:05X}, {} bytes)",
+            desc,
+            DATA_BANK,
+            addr,
+            base_pc + off,
+            data.len()
+        );
     }
 
     // Patch Bank $02 JSL sites
     for (i, &(site_pc, desc)) in HOOK_SITES.iter().enumerate() {
         let target = hook_addrs[i];
-        let jsl = [
-            0x22u8,
-            target as u8,
-            (target >> 8) as u8,
-            (target >> 16) as u8,
-        ];
-        rom.write_expect(
-            site_pc,
-            &jsl,
-            "savemenu:jsl_patch",
-            &Expect::Bytes(&JSL_LZ_BYTES),
-        );
+        let site = pc_to_lorom(site_pc);
+        let jsl = compile_jsl(site.bank, site.addr, target, ExecutionMode::M8X16)?;
+        rom.write_machine_code_expect(&jsl, "savemenu:jsl_patch", &Expect::Bytes(&JSL_LZ_BYTES));
         println!(
             "  JSL patch: {} (PC 0x{:05X}) → ${:06X}",
             desc, site_pc, target

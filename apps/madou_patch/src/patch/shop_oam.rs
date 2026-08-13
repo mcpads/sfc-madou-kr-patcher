@@ -1,4 +1,4 @@
-//! Shop screen OAM sprite localization .
+//! Shop screen OAM sprite localization (Issue U + sold-out).
 //!
 //! Replaces JP OAM text sprites on the shop screen:
 //! - "うる" speech bubble → "판매" (2 × 8x8 4bpp tiles at $50A0)
@@ -35,10 +35,10 @@
 //! VRAM writes via DMA Channel 6 are safe.
 
 use crate::font_gen;
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{compile_jsl, compile_machine_code, ExecutionMode, Inst, MachineCode};
 use crate::patch::hook_common::JSL_LZ_BYTES;
 use crate::patch::tracked_rom::{Expect, TrackedRom};
-use crate::rom::lorom_to_pc;
+use crate::rom::{lorom_to_pc, pc_to_lorom};
 
 // ── Bank / address constants ─────────────────────────────────────
 
@@ -77,7 +77,7 @@ const SHOP_FLAG_WRAM: u16 = 0x1F60;
 const SPEECH_FG: u8 = 1;
 
 /// Foreground (stroke) color index within Palette 7 for cookie text.
-/// Foreground stroke color = $01.
+/// HITL: "글 획 색상 $01"
 const COOKIE_FG: u8 = 1;
 
 /// Foreground (stroke) color index within Palette 7 for sold-out text.
@@ -186,7 +186,11 @@ fn build_shop_tile_data(ttf_data: &[u8], ttf_size: f32) -> Result<Vec<u8>, Strin
 /// - Stage 1: nameplate dp match → set flag, decompress, return
 /// - Stage 2: flag set → clear flag, decompress, DMA overlay, return
 /// - Otherwise: just decompress and return
-fn build_shop_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, String> {
+fn build_shop_hook_code_at(
+    data_bank: u8,
+    data_base: u16,
+    code_addr: u16,
+) -> Result<MachineCode, String> {
     use Inst::*;
 
     let speech_addr = data_base;
@@ -293,12 +297,18 @@ fn build_shop_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, String
         Rtl,
     ];
 
-    assemble(&program)
+    compile_machine_code(program, data_bank, code_addr, ExecutionMode::M8X16)
+}
+
+#[cfg(test)]
+fn build_shop_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, String> {
+    build_shop_hook_code_at(data_bank, data_base, data_base + TILE_DATA_SIZE as u16)
+        .map(|code| code.bytes().to_vec())
 }
 
 // ── Public API ───────────────────────────────────────────────────
 
-/// Apply shop OAM sprite hook .
+/// Apply shop OAM sprite hook (Issue U + sold-out).
 ///
 /// Replaces speech bubble ("うる" → "판매"), cookie ("クッキー" → "쿠키"),
 /// and sold-out ("うりきれ" → "판매완료") using ROM→VRAM direct DMA.
@@ -309,41 +319,29 @@ pub fn apply_shop_oam_hook(
     ttf_size: f32,
 ) -> Result<(), String> {
     let tile_data = build_shop_tile_data(ttf_data, ttf_size)?;
-    let hook_code = build_shop_hook_code(DATA_BANK, DATA_ADDR)?;
+    let code_snes = DATA_ADDR + tile_data.len() as u16;
+    let hook_code = build_shop_hook_code_at(DATA_BANK, DATA_ADDR, code_snes)?;
 
-    // Write tile data + hook code to Bank $25
+    // Write tile data and typed hook code as separate owners.
     let data_pc = lorom_to_pc(DATA_BANK, DATA_ADDR);
     let total_size = tile_data.len() + hook_code.len();
-    {
-        let mut r = rom.region_expect(
-            data_pc,
-            total_size,
-            "shop_oam:data+code",
-            &Expect::FreeSpace(0xFF),
-        );
-        r.copy_at(0, &tile_data);
-        r.copy_at(tile_data.len(), &hook_code);
-    }
+    rom.write_expect(
+        data_pc,
+        &tile_data,
+        "shop_oam:data",
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_machine_code_expect(&hook_code, "shop_oam:code", &Expect::FreeSpace(0xFF));
 
     // Patch JSL $009440 site to jump to our hook
-    let code_snes = DATA_ADDR + tile_data.len() as u16;
     let hook_long = (DATA_BANK as u32) << 16 | code_snes as u32;
-    let jsl = [
-        0x22u8,
-        hook_long as u8,
-        (hook_long >> 8) as u8,
-        (hook_long >> 16) as u8,
-    ];
+    let site = pc_to_lorom(HOOK_SITE_PC);
+    let jsl = compile_jsl(site.bank, site.addr, hook_long, ExecutionMode::M8X16)?;
 
-    rom.write_expect(
-        HOOK_SITE_PC,
-        &jsl,
-        "shop_oam:hook",
-        &Expect::Bytes(&JSL_LZ_BYTES),
-    );
+    rom.write_machine_code_expect(&jsl, "shop_oam:hook", &Expect::Bytes(&JSL_LZ_BYTES));
 
     println!(
-        "  Shop OAM : {}B tiles + {}B code @ ${:02X}:${:04X}-${:04X}",
+        "  Shop OAM (Issue U): {}B tiles + {}B code @ ${:02X}:${:04X}-${:04X}",
         tile_data.len(),
         hook_code.len(),
         DATA_BANK,

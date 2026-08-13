@@ -26,6 +26,7 @@ Commands:
             [--ttf <path>] [--ttf-size <N>] [--charset <path>]
             [--savemenu-ttf <path>] [--savemenu-ttf-size <N>]
             [--worldmap-ttf <path>] [--worldmap-ttf-size <N>]
+            [--title-main <path>] [--title-hanamaru <path>] [--title-subtitle <path>]
             [--text-all] [--text-bank <XX>] [--translations-dir <path>] [--relocate]
             [--engine-hooks]
             Build a patched ROM with Korean fonts and text.
@@ -36,6 +37,9 @@ Commands:
             --savemenu-ttf-size: save menu TTF size (default: 12)
             --worldmap-ttf: 8x8 TTF for worldmap place names (default: dalmoori.ttf)
             --worldmap-ttf-size: worldmap TTF size (default: 8)
+            --title-main: transparent PNG for the main title component
+            --title-hanamaru: transparent PNG for the flower/하나마루 component
+            --title-subtitle: transparent PNG for the 대유치원아 component
             --charset: charset file path (default: translations/ko_charset.txt)
             --relocate: relocate overflow strings to free banks
             --engine-hooks: apply FA/F0 prefix engine hooks (Bank $32)
@@ -59,6 +63,31 @@ Commands:
   apply-bps --rom <path> --patch <path> --output <path>
             Apply a BPS patch to a ROM.
 
+  trace     --rom <path> [--target-vram <XXXX>] [--max-inst <N>]
+            [--no-stop] [--no-nmi] [--max-nmi <N>] [--start-button] [--start-interrupt]
+            [--verbose] [--log-lz] [--event-json <path>] [--no-force-loop-break]
+            [--screenshot <path>] [--screenshot-pal <0..7>] [--screenshot-cols <N>]
+            Trace 65816 execution from reset vector to find VRAM loads.
+            --target-vram: VRAM word address to watch (default: 5000)
+            --max-inst: max instructions to execute (default: 500000)
+            --no-stop: don't stop on first target hit
+            --no-nmi: disable NMI injection on VBlank wait loops
+            --max-nmi: max NMI injections (default: 60)
+            --start-button: simulate Start button press
+            --start-interrupt: pulse Start on each injected NMI (edge-like input)
+            --verbose: print every instruction
+            --log-lz: log each JSL $009440 call with dp$0B/dp$0C snapshot
+            --event-json: write all trace events to JSON file
+            --no-force-loop-break: disable Z-flag toggle loop-break fallback
+            --screenshot: write final VRAM tile atlas screenshot (PPM/P6)
+            --screenshot-pal: SNES palette number for 4bpp decode (default: 0)
+            --screenshot-cols: tile columns in atlas (default: 64)
+
+  trace scenario title-leak --rom <path> [--event-json <path>] [--title-frames <N>]
+            [--screenshot <path>] [--screenshot-pal <0..7>] [--screenshot-cols <N>]
+            Run title-leak detection scenario on a patched ROM.
+            --title-frames: number of initial frames considered \"title stage\" (default: 180)
+
   lookup    [--hex \"FB 67 30 53\"] [--jp <char>] [--ko <char>]
             [--ko-encoding <path>]
             Encoding lookup: convert between hex bytes, JP, and KO characters.
@@ -67,10 +96,33 @@ Commands:
             --ko: look up a KO character (show bytes + JP equivalent)
             --ko-encoding: path to ko_encoding.tsv (default: assets/font_16x16/ko_encoding.tsv)
 
+  disasm    --rom <path> --start <$BB:AAAA> [--length <N>]
+            Disassemble 65816 code from a ROM address.
+            --start: SNES address in $BB:AAAA format (e.g. $00:CE9E)
+            --length: number of bytes to disassemble (default: 64)
+
+  extract-lz --rom <path> --source <$BB:AAAA> --output <path>
+            Decompress one game LZ stream from a LoROM address.
+            --source: LZ stream address in $BB:AAAA format (e.g. $11:EA80)
+            --output: raw decompressed bytes
+
   convert-translations --translations-dir <path> [--chunk-size <N>]
             Convert TSV translation files to JSON format.
             --translations-dir: directory containing TSV files (default: translations)
-            --chunk-size: entries per JSON chunk (default: 48)"
+            --chunk-size: entries per JSON chunk (default: 48)
+
+  audit-translations --rom <path> [--translations-dir <path>] --output <path>
+            Build a combined JP-KR review JSON and compare bank JP text with the ROM.
+            --translations-dir: JSON translation directory (default: translations)
+            --output: generated review JSON path (recommended under out/)
+
+  audit-translation-growth --baseline-translations-dir <path>
+            [--translations-dir <path>] --output <path>
+            Compare two complete translation sources and report entries whose
+            visible cell count or explicit row length increased.
+            --baseline-translations-dir: comparison source selected by the caller
+            --translations-dir: current JSON translation directory (default: translations)
+            --output: generated growth-candidate JSON path (recommended under out/)"
     );
 }
 
@@ -88,6 +140,10 @@ impl Args {
 
     pub fn command(&self) -> Option<&str> {
         self.args.get(1).map(|s| s.as_str())
+    }
+
+    pub fn args_ref(&self) -> &[String] {
+        &self.args
     }
 
     pub fn flag(&self, name: &str) -> bool {

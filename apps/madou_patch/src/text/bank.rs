@@ -127,7 +127,7 @@ pub fn label_to_category(label: &str) -> &'static str {
 ///
 /// tokens_to_string uses: `\n`, `|`, `▽`, `<CHOICE>`, `\n[BOX:X] name`
 /// JSON convention uses: `{NL}`, `{SEP}`, `{PAGE}`, `{CHOICE}`, `{BOX:name}`
-fn text_to_json_convention(text: &str) -> String {
+pub(crate) fn text_to_json_convention(text: &str) -> String {
     let mut result = String::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -149,32 +149,16 @@ fn text_to_json_convention(text: &str) -> String {
                                 _ => box_content,
                             };
                             result.push_str(&format!("{{BOX:{}}}", speaker));
-                            // Skip past "[BOX:X] " in the iterator
-                            for _ in 0..end + 1 {
+                            // `str::find` returns a byte offset. Advance the
+                            // character iterator by the actual character count
+                            // so multibyte speaker names do not consume JP text
+                            // following the marker.
+                            for _ in rest[..=end].chars() {
                                 chars.next();
                             }
                             // Skip trailing space after ]
                             if chars.peek() == Some(&' ') {
                                 chars.next();
-                            }
-                            // Skip the speaker name text that follows
-                            // tokens_to_string format: "\n[BOX:X] speaker_name"
-                            // The speaker name is already consumed by the chars
-                            // Actually, we need to skip "speaker_name" too
-                            // Let me re-check: format is "\n[BOX:{id}] {speaker_name}"
-                            // After "]" we skipped space, now skip speaker name
-                            let name_to_skip = match box_content {
-                                "0" => "アルル",
-                                "1" => "話者1",
-                                "2" => "話者2",
-                                "3" => "NPC",
-                                _ => "",
-                            };
-                            let remaining: String = chars.clone().collect();
-                            if remaining.starts_with(name_to_skip) {
-                                for _ in 0..name_to_skip.chars().count() {
-                                    chars.next();
-                                }
                             }
                             continue;
                         }
@@ -191,6 +175,10 @@ fn text_to_json_convention(text: &str) -> String {
     result = result.replace("<CHOICE>", "{CHOICE}");
     result
 }
+
+#[cfg(test)]
+#[path = "bank_tests.rs"]
+mod tests;
 
 /// A decoded string tagged with its category, for JSON dump.
 pub struct CategorizedString {

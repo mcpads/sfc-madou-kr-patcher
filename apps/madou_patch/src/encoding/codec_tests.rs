@@ -74,29 +74,36 @@ fn decode_unknown_byte() {
 }
 
 #[test]
-fn decode_f0_prefix() {
-    let data = [0xF0, 0x10, 0xFF];
+fn decode_jp_f0_f1_as_single_byte_kanji() {
+    let data = [0xF0, 0xF1, 0xF9, 0xFF];
     let tokens = decode_jp(&data);
-    assert_eq!(tokens.len(), 2);
-    match &tokens[0] {
-        Token::Char(GameChar::Prefixed(0xF0, 0x10), ch) => {
-            assert_eq!(*ch, '\u{FFFD}');
-        }
-        _ => panic!("Expected F0 prefixed char"),
-    }
+
+    assert!(matches!(
+        tokens[0],
+        Token::Char(GameChar::Single(0xF0), '\u{751F}')
+    ));
+    assert!(matches!(
+        tokens[1],
+        Token::Char(GameChar::Single(0xF1), '\u{4E16}')
+    ));
+    assert!(matches!(tokens[2], Token::Control(ControlCode::Newline)));
 }
 
 #[test]
-fn decode_f1_prefix() {
-    let data = [0xF1, 0x05, 0xFF];
-    let tokens = decode_jp(&data);
-    assert_eq!(tokens.len(), 2);
-    match &tokens[0] {
-        Token::Char(GameChar::Prefixed(0xF1, 0x05), ch) => {
-            assert_eq!(*ch, '\u{FFFD}');
-        }
-        _ => panic!("Expected F1 prefixed char"),
-    }
+fn decode_ko_layout_counts_f0_f1_pairs_as_single_glyphs() {
+    let data = [0xF0, 0x54, 0xF1, 0x20, 0xF9, 0xFF];
+    let tokens = decode_ko_layout(&data);
+
+    assert!(matches!(
+        tokens[0],
+        Token::Char(GameChar::Prefixed(0xF0, 0x54), _)
+    ));
+    assert!(matches!(
+        tokens[1],
+        Token::Char(GameChar::Prefixed(0xF1, 0x20), _)
+    ));
+    assert!(matches!(tokens[2], Token::Control(ControlCode::Newline)));
+    assert_eq!(count_chars(&tokens), 2);
 }
 
 #[test]

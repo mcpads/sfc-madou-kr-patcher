@@ -309,32 +309,6 @@ pub fn render_menu_worldmap_tiles(
     Ok(tiles)
 }
 
-/// Convert a 16×16 1-bit bitmap to opaque SNES 2bpp format.
-///
-/// BP1 = $FF always (no transparent pixels). Used for options/stat/magic screens
-/// where text tiles must be fully opaque to match the background.
-/// Color 3 (BP0=1, BP1=1): glyph fill
-/// Color 2 (BP0=0, BP1=1): background fill
-/// Returns [TL, TR, BL, BR] quadrants, each 16 bytes.
-#[cfg(test)]
-pub fn bitmap_to_snes_2bpp_16x16_opaque(bitmap: &[bool; 256]) -> [[u8; 16]; 4] {
-    let mut tiles = [[0u8; 16]; 4];
-    let quadrants: [(usize, usize); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
-    for (qi, &(row_off, col_off)) in quadrants.iter().enumerate() {
-        for r in 0..8usize {
-            let mut bp0: u8 = 0;
-            for c in 0..8usize {
-                if bitmap[(row_off + r) * 16 + (col_off + c)] {
-                    bp0 |= 1 << (7 - c);
-                }
-            }
-            tiles[qi][r * 2] = bp0;
-            tiles[qi][r * 2 + 1] = 0xFF; // BP1 always $FF — opaque
-        }
-    }
-    tiles
-}
-
 /// Render 16×16 KO glyphs as outlined 2bpp tiles (Color 3=fill, Color 2=1px outline).
 ///
 /// Returns 4 tiles per character: [TL, TR, BL, BR], each 16 bytes.
@@ -492,7 +466,7 @@ pub fn render_oam_8x8_4bpp_tiles(
 /// Render characters to 16×16 4bpp tiles for OAM sprites.
 ///
 /// Returns [TL, TR, BL, BR] quadrants per character, each 32 bytes.
-#[allow(dead_code)] // May be needed for future OAM sprite work (OAM sprite rendering)
+#[allow(dead_code)] // May be needed for future OAM sprite work (speech/cookie HITL)
 pub fn render_oam_16x16_4bpp_tiles(
     ttf_data: &[u8],
     ttf_size: f32,

@@ -1,10 +1,12 @@
 mod cli;
+mod disasm;
 mod encoding;
 mod font_gen;
 mod patch;
 mod rom;
 mod text;
 mod textbox;
+mod trace;
 mod verify;
 
 use std::path::PathBuf;
@@ -170,6 +172,15 @@ fn cmd_patch(args: &Args) {
         .value("--worldmap-ttf-size")
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.0); // 0.0 = use default per font
+    let title_main_path = args
+        .path("--title-main")
+        .or_else(|| resolve_default("assets/title_concepts/components/madoujeongi_main_v3.png"));
+    let title_hanamaru_path = args
+        .path("--title-hanamaru")
+        .or_else(|| resolve_default("assets/title_concepts/components/hanamaru_v2.png"));
+    let title_subtitle_path = args
+        .path("--title-subtitle")
+        .or_else(|| resolve_default("assets/title_concepts/components/daeyuchiwona_v2.png"));
 
     let cfg = patch::builder::PatchConfig {
         rom_path: &rom_path,
@@ -189,6 +200,9 @@ fn cmd_patch(args: &Args) {
         charset_path,
         worldmap_ttf_path,
         worldmap_ttf_size,
+        title_main_path,
+        title_hanamaru_path,
+        title_subtitle_path,
     };
 
     patch::builder::run_patch(&cfg).unwrap_or_else(|e| {
@@ -331,11 +345,7 @@ fn cmd_apply_bps(args: &Args) {
         process::exit(1);
     });
 
-    println!(
-        "ROM:   {} ({} bytes)",
-        rom_path.display(),
-        source.len()
-    );
+    println!("ROM:   {} ({} bytes)", rom_path.display(), source.len());
     println!(
         "Patch: {} ({} bytes)",
         patch_path.display(),
@@ -352,11 +362,136 @@ fn cmd_apply_bps(args: &Args) {
         process::exit(1);
     });
 
-    println!(
-        "Output: {} ({} bytes)",
-        output_path.display(),
-        result.len()
+    println!("Output: {} ({} bytes)", output_path.display(), result.len());
+}
+
+fn cmd_trace(args: &Args) {
+    let rom_path = args.require_path("--rom");
+    let data = rom::load_rom(&rom_path).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        process::exit(1);
+    });
+
+    let target_vram = args
+        .value("--target-vram")
+        .and_then(|s| u16::from_str_radix(s, 16).ok())
+        .unwrap_or(0x5000);
+
+    let max_inst = args
+        .value("--max-inst")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(500_000);
+
+    let max_nmi = args
+        .value("--max-nmi")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(60);
+    let screenshot_palette = args
+        .value("--screenshot-pal")
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0);
+    let screenshot_cols = args
+        .value("--screenshot-cols")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64);
+
+    // Backwards-compatible default is ON. Explicit --no-force-loop-break disables it.
+    // If both are provided, --force-loop-break wins.
+    let force_loop_break = args.flag("--force-loop-break") || !args.flag("--no-force-loop-break");
+
+    let config = trace::TracerConfig {
+        max_instructions: max_inst,
+        target_vram,
+        stop_on_target: !args.flag("--no-stop"),
+        verbose: args.flag("--verbose"),
+        inject_nmi: !args.flag("--no-nmi"),
+        max_nmi,
+        start_button: args.flag("--start-button"),
+        start_interrupt: args.flag("--start-interrupt"),
+        log_lz_calls: args.flag("--log-lz"),
+        force_loop_break,
+    };
+
+    eprintln!(
+        "Tracing {} (target VRAM=${:04X}, max={})",
+        rom_path.display(),
+        target_vram,
+        max_inst,
     );
+
+    let result = trace::run_trace(data, &config);
+
+    println!("Stop reason: {:?}", result.stop_reason);
+    println!("Instructions: {}", result.instructions_executed);
+    println!("DMA transfers: {}", result.dma_records.len());
+    println!("VRAM direct writes: {}", result.vram_write_records.len());
+    println!(
+        "Target hits (DMA VRAM ${:04X}): {}",
+        target_vram,
+        result.target_hits.len()
+    );
+    println!(
+        "Target hits (direct VRAM ${:04X}): {}",
+        target_vram,
+        result.target_vram_write_hits.len()
+    );
+    println!("Trace events: {}", result.trace_events.len());
+    println!(
+        "Final PC: ${:02X}:${:04X}",
+        result.final_pc.0, result.final_pc.1
+    );
+
+    if let Some(path) = args.path("--screenshot") {
+        trace::capture::write_vram_tiles_ppm(
+            &path,
+            &result.final_vram,
+            &result.final_cgram,
+            screenshot_palette,
+            screenshot_cols,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error writing screenshot: {}", e);
+            process::exit(1);
+        });
+        println!("Wrote screenshot to {}", path.display());
+    }
+
+    // Write event JSON if requested.
+    if let Some(json_path) = args.path("--event-json") {
+        let json = serde_json::to_string_pretty(&result.trace_events).unwrap_or_else(|e| {
+            eprintln!("Error serializing trace events: {}", e);
+            process::exit(1);
+        });
+        std::fs::write(&json_path, json).unwrap_or_else(|e| {
+            eprintln!("Error writing {}: {}", json_path.display(), e);
+            process::exit(1);
+        });
+        println!(
+            "Wrote {} events to {}",
+            result.trace_events.len(),
+            json_path.display()
+        );
+    }
+}
+
+fn cmd_trace_scenario(args: &Args) {
+    let scenario = args.value("--scenario").or_else(|| {
+        // Positional: `trace scenario title-leak` → index 3
+        args.args_ref().get(3).map(|s| s.as_str())
+    });
+    match scenario {
+        Some("title-leak") => {
+            trace::scenario::run_title_leak(args);
+        }
+        Some(other) => {
+            eprintln!("Unknown scenario: {}", other);
+            process::exit(1);
+        }
+        None => {
+            eprintln!("Error: scenario name required (e.g. 'title-leak')");
+            process::exit(1);
+        }
+    }
 }
 
 fn cmd_lookup(args: &Args) {
@@ -545,6 +680,155 @@ fn cmd_convert_translations(args: &Args) {
     println!("\nConversion complete.");
 }
 
+fn cmd_audit_translations(args: &Args) {
+    let rom_path = args.require_path("--rom");
+    let output_path = args.require_path("--output");
+    let translations_dir = args
+        .path("--translations-dir")
+        .or_else(|| resolve_default("translations"))
+        .unwrap_or_else(|| {
+            eprintln!("Error: --translations-dir is required");
+            process::exit(1);
+        });
+    let data = rom::load_rom(&rom_path).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        process::exit(1);
+    });
+
+    let summary =
+        patch::translation_review::write_review_json(&data, &translations_dir, &output_path)
+            .unwrap_or_else(|e| {
+                eprintln!("Translation audit failed: {}", e);
+                process::exit(1);
+            });
+
+    println!("JP-KR review written: {}", output_path.display());
+    println!("  total entries: {}", summary.total_entries);
+    println!("  bank entries: {}", summary.bank_entries);
+    println!("  encyclopedia entries: {}", summary.encyclopedia_entries);
+    println!("  code patch entries: {}", summary.code_patch_entries);
+    println!("  ROM JP exact matches: {}", summary.rom_matches);
+    println!("  derived subentries: {}", summary.derived_subentries);
+    println!("  ROM JP mismatches: {}", summary.rom_mismatches);
+    println!("  untranslated candidates: {}", summary.untranslated);
+    println!("  tier A certain: {}", summary.tier_a_certain);
+    println!("  tier B strong: {}", summary.tier_b_strong);
+    println!("  tier C context: {}", summary.tier_c_context);
+    println!("  tier D no signal: {}", summary.tier_d_no_signal);
+}
+
+fn cmd_audit_translation_growth(args: &Args) {
+    let baseline_dir = args.require_path("--baseline-translations-dir");
+    let output_path = args.require_path("--output");
+    let translations_dir = args
+        .path("--translations-dir")
+        .or_else(|| resolve_default("translations"))
+        .unwrap_or_else(|| {
+            eprintln!("Error: --translations-dir is required");
+            process::exit(1);
+        });
+
+    let summary = patch::translation_growth::write_growth_audit(
+        &baseline_dir,
+        &translations_dir,
+        &output_path,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Translation growth audit failed: {}", e);
+        process::exit(1);
+    });
+
+    println!(
+        "Translation growth audit written: {}",
+        output_path.display()
+    );
+    println!("  baseline entries: {}", summary.baseline_entries);
+    println!("  current entries: {}", summary.current_entries);
+    println!("  changed entries: {}", summary.changed_entries);
+    println!("  new entries: {}", summary.new_entries);
+    println!("  removed entries: {}", summary.removed_entries);
+    println!("  growth candidates: {}", summary.growth_candidates);
+    println!(
+        "  crossed common 10-cell line (candidate signal): {}",
+        summary.crossed_common_10_cell_line
+    );
+    println!("  confirmed fits: {}", summary.confirmed_fits);
+    println!(
+        "  confirmed new overflows: {}",
+        summary.confirmed_new_overflows
+    );
+    println!(
+        "  confirmed existing overflows: {}",
+        summary.confirmed_existing_overflows
+    );
+}
+
+fn cmd_disasm(args: &Args) {
+    let rom_path = args.require_path("--rom");
+    let start_str = args.value("--start").unwrap_or_else(|| {
+        eprintln!("Error: --start is required (e.g. $00:CE9E)");
+        usage();
+        process::exit(1);
+    });
+    let length = args
+        .value("--length")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64);
+
+    disasm::run_disasm(&rom_path, start_str, length).unwrap_or_else(|e| {
+        eprintln!("Disasm failed: {}", e);
+        process::exit(1);
+    });
+}
+
+fn cmd_extract_lz(args: &Args) {
+    let rom_path = args.require_path("--rom");
+    let output_path = args.require_path("--output");
+    let source_str = args.value("--source").unwrap_or_else(|| {
+        eprintln!("Error: --source is required (e.g. $11:EA80)");
+        usage();
+        process::exit(1);
+    });
+    let source = rom::SnesAddr::parse(source_str).unwrap_or_else(|| {
+        eprintln!("Error: invalid SNES address: {}", source_str);
+        process::exit(1);
+    });
+    if source.addr < 0x8000 {
+        eprintln!(
+            "Error: LoROM source address must be in $8000-$FFFF: {}",
+            source
+        );
+        process::exit(1);
+    }
+
+    let data = rom::load_rom(&rom_path).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        process::exit(1);
+    });
+    let source_pc = source.to_pc();
+    let (decompressed, consumed) =
+        patch::font::decompress_lz(&data, source_pc).unwrap_or_else(|e| {
+            eprintln!("LZ extraction failed at {}: {}", source, e);
+            process::exit(1);
+        });
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("Failed to create '{}': {}", parent.display(), e);
+            process::exit(1);
+        });
+    }
+    std::fs::write(&output_path, &decompressed).unwrap_or_else(|e| {
+        eprintln!("Failed to write '{}': {}", output_path.display(), e);
+        process::exit(1);
+    });
+
+    println!("LZ source: {} (PC 0x{:06X})", source, source_pc);
+    println!("Compressed bytes consumed: {}", consumed);
+    println!("Decompressed bytes written: {}", decompressed.len());
+    println!("Output: {}", output_path.display());
+}
+
 fn main() {
     let args = Args::new();
 
@@ -557,9 +841,21 @@ fn main() {
         Some("ips") => cmd_ips(&args),
         Some("bps") => cmd_bps(&args),
         Some("apply-bps") => cmd_apply_bps(&args),
+        Some("trace") => {
+            // Check for `trace scenario <name>` subcommand.
+            if args.args_ref().get(2).map(|s| s.as_str()) == Some("scenario") {
+                cmd_trace_scenario(&args);
+            } else {
+                cmd_trace(&args);
+            }
+        }
         Some("lookup") => cmd_lookup(&args),
         Some("generate-font") => cmd_generate_font(&args),
+        Some("disasm") => cmd_disasm(&args),
+        Some("extract-lz") => cmd_extract_lz(&args),
         Some("convert-translations") => cmd_convert_translations(&args),
+        Some("audit-translations") => cmd_audit_translations(&args),
+        Some("audit-translation-growth") => cmd_audit_translation_growth(&args),
         _ => {
             usage();
             process::exit(1);

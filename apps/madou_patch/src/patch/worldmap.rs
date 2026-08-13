@@ -22,10 +22,12 @@
 //! Block D loads to $7F:$2000 alongside A/B/C.
 //! Block E has only 1 tile difference between JP/EN — skip for KO.
 
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{
+    compile_fixed_machine_code, compile_jsl, compile_machine_code, ExecutionMode, Inst, MachineCode,
+};
 use crate::patch::font;
 use crate::patch::tracked_rom::{Expect, TrackedRom};
-use crate::rom::lorom_to_pc;
+use crate::rom::{lorom_to_pc, pc_to_lorom};
 
 pub mod consts {
     // ── Hook site 1: LZ intercept ($10:$B562) ────────────────────────
@@ -50,10 +52,8 @@ pub mod consts {
     pub const HOOK_CODE_BANK: u8 = 0x10;
     /// Flag-clear hook at $D000 (~15 bytes).
     pub const HOOK_CODE_ADDR: u16 = 0xD000;
-    pub const HOOK_CODE_PC: usize = 0x85000; // lorom_to_pc(0x10, 0xD000)
     /// KO loader hook at $D020 (~300 bytes). After flag-clear code.
     pub const LOADER_CODE_ADDR: u16 = 0xD020;
-    pub const LOADER_CODE_PC: usize = 0x85020; // lorom_to_pc(0x10, 0xD020)
 
     // ── WRAM flag ────────────────────────────────────────────────────
     /// $7F:$FF00 — KO data loaded flag. 0=needs load, nonzero=loaded.
@@ -145,7 +145,7 @@ fn decompress_jp_blocks(rom: &[u8]) -> Result<Vec<(usize, Vec<u8>)>, String> {
 /// the LZ decompressor, the WRAM flag resets — so the worldmap handler will
 /// re-load KO data on its next entry.
 #[allow(clippy::vec_init_then_push)]
-fn build_hook_code() -> Result<Vec<u8>, String> {
+fn compile_hook_code() -> Result<MachineCode, String> {
     use Inst::*;
     let mut program: Vec<Inst> = Vec::new();
 
@@ -157,7 +157,17 @@ fn build_hook_code() -> Result<Vec<u8>, String> {
     program.push(Jsl(LZ_DECOMPRESS)); // JSL $009440
     program.push(Rtl);
 
-    assemble(&program)
+    compile_machine_code(
+        program,
+        HOOK_CODE_BANK,
+        HOOK_CODE_ADDR,
+        ExecutionMode::M16X16,
+    )
+}
+
+#[cfg(test)]
+fn build_hook_code() -> Result<Vec<u8>, String> {
+    compile_hook_code().map(|code| code.bytes().to_vec())
 }
 
 /// Build the KO loader hook at $10:$D020 (Hook site 2: worldmap handler).
@@ -174,7 +184,7 @@ fn build_hook_code() -> Result<Vec<u8>, String> {
 ///
 /// `data_addrs` maps condition index → (bank, SNES address) of KO data in ROM.
 #[allow(clippy::vec_init_then_push)]
-fn build_loader_code(data_addrs: &[(u8, u16)]) -> Result<Vec<u8>, String> {
+fn compile_loader_code(data_addrs: &[(u8, u16)]) -> Result<MachineCode, String> {
     use Inst::*;
     let mut program: Vec<Inst> = Vec::new();
 
@@ -201,7 +211,17 @@ fn build_loader_code(data_addrs: &[(u8, u16)]) -> Result<Vec<u8>, String> {
 
     program.push(Jml(LOADER_RETURN_ADDR)); // jump back to $03:CC5A
 
-    assemble(&program)
+    compile_machine_code(
+        program,
+        HOOK_CODE_BANK,
+        LOADER_CODE_ADDR,
+        ExecutionMode::M16X16,
+    )
+}
+
+#[cfg(test)]
+fn build_loader_code(data_addrs: &[(u8, u16)]) -> Result<Vec<u8>, String> {
+    compile_loader_code(data_addrs).map(|code| code.bytes().to_vec())
 }
 
 /// Emit DMA ch5 register setup + trigger for one LZ block (no SEP/RTL).
@@ -366,9 +386,9 @@ pub fn apply_worldmap_hook(
     let total_size: usize = blocks.iter().map(|(_, d)| d.len()).sum();
 
     // Step 3: Build two hook codes
-    let flag_clear_code = build_hook_code()?;
+    let flag_clear_code = compile_hook_code()?;
     let data_addrs: Vec<(u8, u16)> = layout.iter().map(|&(b, a, _)| (b, a)).collect();
-    let loader_code = build_loader_code(&data_addrs)?;
+    let loader_code = compile_loader_code(&data_addrs)?;
 
     // Verify codes fit in their reserved areas
     let flag_clear_limit = (LOADER_CODE_ADDR - HOOK_CODE_ADDR) as usize;
@@ -396,14 +416,12 @@ pub fn apply_worldmap_hook(
     }
 
     // Step 5: Write hook codes to Bank $10
-    rom.write_expect(
-        HOOK_CODE_PC,
+    rom.write_machine_code_expect(
         &flag_clear_code,
         "worldmap:flag_clear_hook",
         &Expect::FreeSpace(0xFF),
     );
-    rom.write_expect(
-        LOADER_CODE_PC,
+    rom.write_machine_code_expect(
         &loader_code,
         "worldmap:loader_hook",
         &Expect::FreeSpace(0xFF),
@@ -411,14 +429,14 @@ pub fn apply_worldmap_hook(
 
     // Step 6: Patch JSL at $10:$B562 → flag-clear hook ($10:$D000)
     let hook1_long: u32 = (HOOK_CODE_BANK as u32) << 16 | (HOOK_CODE_ADDR as u32);
-    let jsl1 = [
-        0x22u8,
-        hook1_long as u8,
-        (hook1_long >> 8) as u8,
-        (hook1_long >> 16) as u8,
-    ];
-    rom.write_expect(
-        HOOK_CALL_SITE_PC,
+    let hook1_site = pc_to_lorom(HOOK_CALL_SITE_PC);
+    let jsl1 = compile_jsl(
+        hook1_site.bank,
+        hook1_site.addr,
+        hook1_long,
+        ExecutionMode::M16X16,
+    )?;
+    rom.write_machine_code_expect(
         &jsl1,
         "worldmap:sky_jsl_patch",
         &Expect::Bytes(&[0x22, 0x40, 0x94, 0x00]),
@@ -428,14 +446,14 @@ pub fn apply_worldmap_hook(
     // JML avoids pushing a return address, which is critical because the hook
     // executes a relocated PHX that would corrupt the JSL return address.
     let hook2_long: u32 = (HOOK_CODE_BANK as u32) << 16 | (LOADER_CODE_ADDR as u32);
-    let jml2 = [
-        0x5Cu8, // JML opcode
-        hook2_long as u8,
-        (hook2_long >> 8) as u8,
-        (hook2_long >> 16) as u8,
-    ];
-    rom.write_expect(
-        LOADER_CALL_SITE_PC,
+    let hook2_site = pc_to_lorom(LOADER_CALL_SITE_PC);
+    let jml2 = compile_fixed_machine_code::<4>(
+        vec![Inst::Jml(hook2_long)],
+        hook2_site.bank,
+        hook2_site.addr,
+        ExecutionMode::M16X16,
+    )?;
+    rom.write_machine_code_expect(
         &jml2,
         "worldmap:loader_jml_patch",
         &Expect::Bytes(&LOADER_ORIG_BYTES),
@@ -541,7 +559,6 @@ pub mod menu_consts {
     pub const OBJ_DATA_PC: usize = lorom_to_pc(OBJ_DATA_BANK, OBJ_DATA_ADDR);
     /// OBJ patch routine placement (after bubble data)
     pub const OBJ_CODE_ADDR: u16 = 0xF600;
-    pub const OBJ_CODE_PC: usize = lorom_to_pc(OBJ_DATA_BANK, OBJ_CODE_ADDR);
     pub const OBJ_TITLE_CHARS: &[char] = &['월', '드', '맵'];
 
     // ── OBJ bubble text ("현위치", "목적지", "이것") ─────────────────
@@ -606,32 +623,37 @@ fn remap_tile_index(jp_idx: u8) -> u8 {
 /// Tilemap dump reference (JP ROM, `dump_menu_tilemap_text_groups` test):
 ///   Screen 2 (rows 0-27): town names in speech bubbles
 ///   Screen 3 (rows 28-55): region names with boundary lines
+const MENU_SUKETOUDARA_HOME: &str = "스케토우다라Jr 집";
+const MENU_SUKETOUDARA_HOME_TILES: usize = 10;
+const MENU_DEATH_VALLEY: &str = "죽음계곡";
+const MENU_DEATH_VALLEY_TILES: usize = 4;
+
 const MENU_GROUP_TEXTS: &[&str] = &[
-    "비의 숲",           // G0  row=5  あめのもり
-    "유적 마을",         // G1  row=6  いせきむら          — 띄어쓰기
-    "개구리",            // G2  row=10 かえるの (split row 1)
-    "대마왕의 유적",     // G3  row=10 ぞうだいまおうのいせき — 띄어쓰기
-    "연못",              // G4  row=11 いけ (split row 2)
-    "옛날 마을",         // G5  row=14 むかしむら          — 띄어쓰기
-    "",                  // G6  row=14 (blank — 선인의 산 merged to G8)
-    "어둠의 우물",       // G7  row=14 やみのいど          — 띄어쓰기 (6ch→확장)
-    "선인의 산",         // G8  row=15 3행→2행 병합 (2번째줄부터)
-    "입구",              // G9  row=16 いりぐち
-    "늑대 마을",         // G10 row=17 おおかみむら        — 띄어쓰기
-    "마도유치원",        // G11 row=18 ようちえん          — 띄어쓰기 없음
-    "스케토우다라Jr 집", // G12 row=20 すけとうだらのいえ  — 띄어쓰기
-    "사탄님의",          // G13 row=20 サタンさまの (2-row bubble: row 1)
-    "별장",              // G14 row=21 べっぞう (2-row bubble: row 2)
-    "마도 마을",         // G15 row=23 まどうむら          — 띄어쓰기
-    "아르르의 집",       // G16 row=25 アルルのいえ
-    "할머니의 집",       // G17 row=25 おばあちゃんのいえ
-    "",                  // G18 row=29 ゜ (standalone dakuten — skip)
-    "하피의 산",         // G19 row=30 ハーピーのやま
-    "죽음계곡",          // G20 row=33 しのたに (4 slots)
-    "선인의 산",         // G21 row=36 せんにんの
-    "빛의 숲",           // G22 row=37 ひかりのもり
-    "",                  // G23 row=38 やま (blank)
-    "어둠의 숲",         // G24 row=47 やみのもり
+    "비의 숲",             // G0  row=5  あめのもり
+    "유적 마을",           // G1  row=6  いせきむら          — 띄어쓰기
+    "개구리",              // G2  row=10 かえるの (split row 1)
+    "대마왕의 유적",       // G3  row=10 ぞうだいまおうのいせき — 띄어쓰기
+    "연못",                // G4  row=11 いけ (split row 2)
+    "옛날 마을",           // G5  row=14 むかしむら          — 띄어쓰기
+    "",                    // G6  row=14 (blank — 선인의 산 merged to G8)
+    "어둠의 우물",         // G7  row=14 やみのいど          — 띄어쓰기 (6ch→확장)
+    "선인의 산",           // G8  row=15 3행→2행 병합 (2번째줄부터)
+    "입구",                // G9  row=16 いりぐち
+    "늑대 마을",           // G10 row=17 おおかみむら        — 띄어쓰기
+    "마도유치원",          // G11 row=18 ようちえん          — 띄어쓰기 없음
+    MENU_SUKETOUDARA_HOME, // G12 row=20 すけとうだらのいえ — 10타일 한도
+    "사탄님의",            // G13 row=20 サタンさまの (2-row bubble: row 1)
+    "별장",                // G14 row=21 べっぞう (2-row bubble: row 2)
+    "마도 마을",           // G15 row=23 まどうむら          — 띄어쓰기
+    "아르르의 집",         // G16 row=25 アルルのいえ
+    "할머니의 집",         // G17 row=25 おばあちゃんのいえ
+    "",                    // G18 row=29 ゜ (standalone dakuten — skip)
+    "하피의 산",           // G19 row=30 ハーピーのやま
+    MENU_DEATH_VALLEY,     // G20 row=33 しのたに (4타일 한도)
+    "선인의 산",           // G21 row=36 せんにんの
+    "빛의 숲",             // G22 row=37 ひかりのもり
+    "",                    // G23 row=38 やま (blank)
+    "어둠의 숲",           // G24 row=47 やみのもり
 ];
 
 /// Sky worldmap framed text box placement.
@@ -757,6 +779,17 @@ fn find_text_groups(tilemap: &[u8]) -> Vec<Vec<usize>> {
 /// Pass 3: Write centered KO glyph tile indices at each text group's positions.
 /// Pass 4: Override specific positions from VWALL to HBAR.
 fn remap_tilemap(tilemap: &mut [u8], ko_char_indices: &std::collections::HashMap<char, u8>) {
+    debug_assert_eq!(
+        MENU_SUKETOUDARA_HOME.chars().count(),
+        MENU_SUKETOUDARA_HOME_TILES,
+        "스케토우다라Jr 집 menu label must fill its fixed tile span",
+    );
+    debug_assert_eq!(
+        MENU_DEATH_VALLEY.chars().count(),
+        MENU_DEATH_VALLEY_TILES,
+        "죽음계곡 menu label must fill its fixed tile span",
+    );
+
     // Pass 1: Find text groups from JP tilemap (must happen before clearing)
     let groups = find_text_groups(tilemap);
 
@@ -993,7 +1026,7 @@ fn adjust_menu_frames(tilemap: &mut [u8], ko_char_indices: &std::collections::Ha
         ko_char_indices,
         (19, 9, 21, 20), // clear (col 9 was blank in JP)
         (19, 9, 21, 20), // new frame
-        &[(20, "스케토우다라Jr 집")],
+        &[(20, MENU_SUKETOUDARA_HOME)],
         &[(21, 17, KO_DOWNPTR, 0x20)],
     );
 
@@ -1141,7 +1174,7 @@ fn build_ko_chr(jp_chr: &[u8], ko_glyph_tiles: &[[u8; 16]]) -> Vec<u8> {
 ///
 /// Analyzes tile $0C (first text character tile of "ワールドマップ") to find
 /// the most frequent non-zero color index. Returns the detected color or
-/// fallback value 6 (the known OBJ palette index from ROM analysis).
+/// fallback value 6 (the known OBJ palette index from HITL).
 fn detect_fg_color_4bpp(obj_data: &[u8]) -> u8 {
     let tile_offset = 0x0C * 32; // 4bpp = 32 bytes per tile
     if tile_offset + 32 > obj_data.len() {
@@ -1430,7 +1463,7 @@ fn build_bubble_text_tiles(bitmaps_8x8: &[[bool; 64]], canvas_width_tiles: usize
 /// then patches specific tile offsets with pre-rendered KO 4bpp data via 8 MVN blocks
 /// (6 title + 2 bubble text).
 #[allow(clippy::vec_init_then_push)]
-fn build_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<Vec<u8>, String> {
+fn compile_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<MachineCode, String> {
     use Inst::*;
 
     let mut program: Vec<Inst> = Vec::new();
@@ -1475,7 +1508,17 @@ fn build_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<Vec<u8>, String
     program.push(Plp);
     program.push(Rtl);
 
-    assemble(&program)
+    compile_machine_code(
+        program,
+        menu_consts::OBJ_DATA_BANK,
+        menu_consts::OBJ_CODE_ADDR,
+        ExecutionMode::M8X16,
+    )
+}
+
+#[cfg(test)]
+fn build_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<Vec<u8>, String> {
+    compile_obj_patch_code(data_addr, data_bank).map(|code| code.bytes().to_vec())
 }
 
 /// Build menu/sky worldmap hook assembly code.
@@ -1483,7 +1526,7 @@ fn build_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<Vec<u8>, String
 /// The hook site at $03:$C3F0 is a **generic LZ loading subroutine** used by
 /// multiple subsystems (menu worldmap, sky worldmap, encyclopedia, etc.). We must
 /// check both dp$0B (source bank) and dp$0C:$0D (LZ source address) to avoid
-/// intercepting unrelated LZ loads (e.g. encyclopedia data).
+/// intercepting unrelated LZ loads (e.g. encyclopedia data → Issue O).
 ///
 /// - dp$0B == $25 AND dp$0C:$0D == $B784 → DMA KO CHR from ROM to WRAM $7F:$6000
 /// - dp$0B == $25 AND dp$0C:$0D == $B9E7 → DMA KO menu tilemap to WRAM $7F:$7000
@@ -1491,14 +1534,15 @@ fn build_obj_patch_code(data_addr: u16, data_bank: u8) -> Result<Vec<u8>, String
 /// - dp$0B == $25 AND dp$0C:$0D == $B10C → JSL OBJ patch-after-decompress
 /// - else → passthrough JSL $009440
 #[allow(clippy::vec_init_then_push)]
-fn build_menu_hook_code(
+fn build_menu_hook_code_at(
+    code_addr: u16,
     chr_addr: (u8, u16),
     chr_size: u16,
     tm_addr: (u8, u16),
     tm_size: u16,
     sky_tm: Option<((u8, u16), u16)>,
     obj_routine: Option<u32>,
-) -> Result<Vec<u8>, String> {
+) -> Result<MachineCode, String> {
     use Inst::*;
 
     let mut program: Vec<Inst> = Vec::new();
@@ -1561,7 +1605,33 @@ fn build_menu_hook_code(
     program.push(Jsl(menu_consts::LZ_DECOMPRESS));
     program.push(Rtl);
 
-    assemble(&program)
+    compile_machine_code(
+        program,
+        menu_consts::MENU_DATA_BANK,
+        code_addr,
+        ExecutionMode::M8X16,
+    )
+}
+
+#[cfg(test)]
+fn build_menu_hook_code(
+    chr_addr: (u8, u16),
+    chr_size: u16,
+    tm_addr: (u8, u16),
+    tm_size: u16,
+    sky_tm: Option<((u8, u16), u16)>,
+    obj_routine: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    build_menu_hook_code_at(
+        0xD000,
+        chr_addr,
+        chr_size,
+        tm_addr,
+        tm_size,
+        sky_tm,
+        obj_routine,
+    )
+    .map(|code| code.bytes().to_vec())
 }
 
 /// Append a DMA ch5 handler for a menu worldmap block.
@@ -1659,7 +1729,6 @@ pub fn apply_menu_worldmap_hook(
 
     // Dynamic layout: code → CHR → menu TM → sky TM (all 16-byte aligned)
     let menu_chr_addr = menu_code_addr + CODE_TO_CHR_OFFSET;
-    let menu_code_pc = lorom_to_pc(MENU_DATA_BANK, menu_code_addr);
     let menu_chr_pc = lorom_to_pc(MENU_DATA_BANK, menu_chr_addr);
 
     let ko_chr_len = ko_chr.len();
@@ -1714,8 +1783,8 @@ pub fn apply_menu_worldmap_hook(
         }
 
         // Patch code (at OBJ_CODE_PC, after bubble data)
-        let obj_code = build_obj_patch_code(OBJ_DATA_ADDR, OBJ_DATA_BANK)?;
-        rom.write(OBJ_CODE_PC, &obj_code, "worldmap:obj_code");
+        let obj_code = compile_obj_patch_code(OBJ_DATA_ADDR, OBJ_DATA_BANK)?;
+        rom.write_machine_code_expect(&obj_code, "worldmap:obj_code", &Expect::FreeSpace(0xFF));
 
         let long_addr = (OBJ_DATA_BANK as u32) << 16 | OBJ_CODE_ADDR as u32;
         println!(
@@ -1739,7 +1808,8 @@ pub fn apply_menu_worldmap_hook(
 
     // Step 6: Build and write hook code
     let sky_tm_param = Some(((MENU_DATA_BANK, sky_tm_addr), ko_sky_tm.len() as u16));
-    let hook_code = build_menu_hook_code(
+    let hook_code = build_menu_hook_code_at(
+        menu_code_addr,
         (MENU_DATA_BANK, menu_chr_addr),
         ko_chr_len as u16,
         (MENU_DATA_BANK, menu_tm_addr),
@@ -1756,8 +1826,7 @@ pub fn apply_menu_worldmap_hook(
             code_space
         ));
     }
-    rom.write_expect(
-        menu_code_pc,
+    rom.write_machine_code_expect(
         &hook_code,
         "worldmap:menu_hook_code",
         &Expect::FreeSpace(0xFF),
@@ -1765,14 +1834,9 @@ pub fn apply_menu_worldmap_hook(
 
     // Step 7: Patch JSL at $03:$C3F0
     let hook_long: u32 = (MENU_DATA_BANK as u32) << 16 | (menu_code_addr as u32);
-    let jsl = [
-        0x22u8,
-        hook_long as u8,
-        (hook_long >> 8) as u8,
-        (hook_long >> 16) as u8,
-    ];
-    rom.write_expect(
-        HOOK_SITE_PC,
+    let site = pc_to_lorom(HOOK_SITE_PC);
+    let jsl = compile_jsl(site.bank, site.addr, hook_long, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
         &jsl,
         "worldmap:menu_jsl_patch",
         &Expect::Bytes(&[0x22, 0x40, 0x94, 0x00]),

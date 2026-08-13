@@ -98,13 +98,35 @@ fn region_read_access() {
 }
 
 #[test]
-fn untracked_writes_detected() {
-    let original = vec![0u8; 16];
-    let mut rom = TrackedRom::new(original.clone());
-    // Only write to offset 4, but manually track nothing extra
+fn untracked_final_difference_is_rejected() {
+    let mut rom = TrackedRom::new(vec![0u8; 16]);
     rom.write(4, &[0xFF], "tracked");
-    // No untracked writes — all changes are tracked
-    assert!(rom.check_untracked_writes(&original).is_ok());
+    rom.data[12] = 0xAA;
+    assert!(rom.check().is_err());
+}
+
+#[test]
+fn registered_replacement_drift_is_rejected() {
+    let mut rom = TrackedRom::new(vec![0u8; 16]);
+    rom.write(4, &[0xFF], "tracked");
+    rom.data[4] = 0xAA;
+    assert!(rom.check().is_err());
+}
+
+#[test]
+fn typed_machine_code_is_independently_reassembled() {
+    use crate::patch::asm::{compile_machine_code, ExecutionMode, Inst};
+
+    let mut rom = TrackedRom::new(vec![0xFF; 0x8000]);
+    let code = compile_machine_code(
+        vec![Inst::Nop, Inst::Rtl],
+        0x00,
+        0x8000,
+        ExecutionMode::M8X16,
+    )
+    .unwrap();
+    rom.write_machine_code_expect(&code, "test:hook", &Expect::FreeSpace(0xFF));
+    assert!(rom.check().is_ok());
 }
 
 #[test]

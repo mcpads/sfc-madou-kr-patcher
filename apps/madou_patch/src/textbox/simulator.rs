@@ -2,6 +2,7 @@
 
 use crate::encoding::codec;
 use crate::text::bank::DecodedString;
+use crate::text::control::{self, BankConfig, TextBoxProfile};
 use crate::textbox::layout;
 
 /// Result of verifying a single string.
@@ -18,9 +19,9 @@ pub struct VerifyResult {
 }
 
 /// Verify a decoded string for text box overflow.
-pub fn verify_string(ds: &DecodedString, box_lines: usize) -> VerifyResult {
+pub fn verify_string(ds: &DecodedString, profile: TextBoxProfile) -> VerifyResult {
     let tokens = codec::decode_jp(&ds.raw);
-    let render = layout::render_pages_with_limit(&tokens, box_lines);
+    let render = layout::render_pages_with_profile(&tokens, profile);
 
     let max_line_width = render
         .pages
@@ -49,10 +50,10 @@ pub fn verify_string(ds: &DecodedString, box_lines: usize) -> VerifyResult {
 }
 
 /// Verify all strings and return overflow report.
-pub fn verify_all(strings: &[DecodedString], box_lines: usize) -> Vec<VerifyResult> {
+pub fn verify_all(strings: &[DecodedString], config: &BankConfig) -> Vec<VerifyResult> {
     strings
         .iter()
-        .map(|ds| verify_string(ds, box_lines))
+        .map(|ds| verify_string(ds, control::text_box_profile(config, ds.snes_addr)))
         .collect()
 }
 
@@ -81,3 +82,7 @@ pub fn print_report(results: &[VerifyResult]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "simulator_tests.rs"]
+mod tests;

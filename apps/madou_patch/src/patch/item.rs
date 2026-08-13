@@ -31,7 +31,7 @@ const ITEM_NAME_STRIDE: usize = 10;
 /// Order matches the JP original at $2B:$FD8B.
 const KO_ITEM_NAMES: [&str; ITEM_COUNT] = [
     "락교",         // 0: らっきょ
-    "후쿠신즈케",   // 1: ふくしんづけ
+    "행운절임",     // 1: ふくしんづけ
     "카레라이스",   // 2: カレーライス
     "마도주",       // 3: 魔導酒
     "모모모주",     // 4: ももも酒

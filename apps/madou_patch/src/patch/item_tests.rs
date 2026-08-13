@@ -118,6 +118,6 @@ fn table_fits_in_bank() {
     let table_size = ITEM_COUNT * ITEM_NAME_STRIDE;
     assert_eq!(table_size, 180);
     // Table starts at $FD8B and is 180 bytes → ends at $FE3E
-    let end_addr = 0xFD8Bu16 + table_size as u16;
-    assert!(end_addr <= 0xFFFF, "Table overflows Bank $2B");
+    let end_addr = 0xFD8Busize + table_size;
+    assert!(end_addr <= 0x10000, "Table overflows Bank $2B");
 }

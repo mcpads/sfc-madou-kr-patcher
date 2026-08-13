@@ -35,6 +35,13 @@ fn find_banks_by_number_returns_all() {
 }
 
 #[test]
+fn diary_range_includes_final_character_and_terminator() {
+    let config = find_by_label("03").unwrap();
+
+    assert_eq!(config.end_addr, 0xDA71);
+}
+
+#[test]
 fn find_bank_backward_compat() {
     // find_bank returns the first match for each bank number
     let config = find_bank(0x01).unwrap();
@@ -44,4 +51,44 @@ fn find_bank_backward_compat() {
     assert_eq!(config.label, "2B");
 
     assert!(find_bank(0xFF).is_none());
+}
+
+#[test]
+fn menu_descriptions_use_fixed_two_row_profile() {
+    let config = find_by_label("01").unwrap();
+    let profile = text_box_profile(config, MENU_COMMAND_DESCRIPTION_START);
+
+    assert_eq!(profile.max_width_tiles, 20);
+    assert_eq!(profile.max_lines, 2);
+    assert_eq!(profile.wrap_mode, LineWrapMode::FixedRows);
+
+    let last_profile = text_box_profile(config, MENU_COMMAND_DESCRIPTION_END - 1);
+    assert_eq!(last_profile, profile);
+}
+
+#[test]
+fn diary_uses_fixed_fifteen_cell_rows() {
+    let config = find_by_label("03").unwrap();
+    let profile = text_box_profile(config, DIARY_TEXT_START);
+
+    assert_eq!(profile.max_width_tiles, 30);
+    assert_eq!(profile.max_lines, 5);
+    assert_eq!(profile.wrap_mode, LineWrapMode::FixedRows);
+
+    let last_profile = text_box_profile(config, DIARY_TEXT_END - 1);
+    assert_eq!(last_profile, profile);
+}
+
+#[test]
+fn adjacent_bank_01_text_keeps_automatic_wrapping() {
+    let config = find_by_label("01").unwrap();
+
+    assert_eq!(
+        text_box_profile(config, MENU_COMMAND_DESCRIPTION_START - 1).wrap_mode,
+        LineWrapMode::Automatic
+    );
+    assert_eq!(
+        text_box_profile(config, MENU_COMMAND_DESCRIPTION_END).wrap_mode,
+        LineWrapMode::Automatic
+    );
 }

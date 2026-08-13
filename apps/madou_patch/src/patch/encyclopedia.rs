@@ -13,7 +13,9 @@
 //!   4. Writes the KO name table to Bank $03 free space
 
 use crate::encoding::ko;
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{
+    compile_fixed_machine_code, compile_machine_code, ExecutionMode, Inst, MachineCode,
+};
 use crate::patch::tracked_rom::{Expect, TrackedRom};
 use crate::rom::lorom_to_pc;
 use std::collections::HashMap;
@@ -62,6 +64,7 @@ const DESC_TABLE_BASE: u16 = 0xF000;
 
 /// C6EE char processing: $03:$C742 (PC 0x1C742).
 /// Original bytes: EB A9 0F (XBA / LDA #$0F) — replaced with JMP hook (3 bytes).
+#[cfg(test)]
 const C6EE_PATCH_PC: usize = 0x1C742;
 /// Address after the replaced bytes (continue original path).
 const C6EE_CONTINUE_ADDR: u16 = 0xC747; // $C745 STA dp$0B is part of replaced code,
@@ -74,6 +77,7 @@ const TILE_CALC_ADDR: u16 = 0xC755;
 
 /// Monster name hook: $03:$B626 (PC 0x1B626).
 /// Original bytes: A0 AA 17 (LDY #$17AA) — replaced with JMP hook (3 bytes).
+#[cfg(test)]
 const NAME_PATCH_PC: usize = 0x1B626;
 /// JSL $03:C6EE at $03:$B62D (continue after hook sets up Y and dp$0B).
 const NAME_JSL_ADDR: u16 = 0xB62D;
@@ -242,7 +246,7 @@ fn truncate_at_char_boundary(bytes: &[u8], max_len: usize) -> Vec<u8> {
 ///        dp$0B is about to be set to the font tile bank.
 ///        DB = text source bank.
 ///        Y = current text read position.
-fn build_c6ee_hook() -> Vec<u8> {
+fn compile_c6ee_hook_at(addr: u16) -> MachineCode {
     use Inst::*;
     let program = vec![
         // Check for F1 prefix (Bank $32:$8000, page 0)
@@ -282,7 +286,8 @@ fn build_c6ee_hook() -> Vec<u8> {
         Xba,  // XBA → A_lo = F0_index, A_hi = $01
         JmpAbs(TILE_CALC_ADDR),
     ];
-    assemble(&program).expect("C6EE F1/F0 hook assembly failed")
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .expect("C6EE F1/F0 hook assembly failed")
 }
 
 // ── Monster Name Hook ─────────────────────────────────────────────────
@@ -300,7 +305,7 @@ fn build_c6ee_hook() -> Vec<u8> {
 /// before multiplying by NAME_ENTRY_SIZE.
 ///
 /// Entry: 8-bit A/M mode. dp$17B4 was saved on stack.
-fn build_name_hook(name_table_addr: u16) -> Vec<u8> {
+fn compile_name_hook_at(addr: u16, name_table_addr: u16) -> MachineCode {
     use Inst::*;
     // WRAM $17B6 = $1760 + $56 (INDEX_OFFSET_IN_BLOCK, separate from name slot)
     let index_addr: u16 = 0x1760 + INDEX_OFFSET_IN_BLOCK as u16; // $17B6
@@ -330,7 +335,19 @@ fn build_name_hook(name_table_addr: u16) -> Vec<u8> {
         // Jump to JSL $03:C6EE (skip the original LDA #$00 / STA dp$0B at $B629)
         JmpAbs(NAME_JSL_ADDR),
     ];
-    assemble(&program).expect("name hook assembly failed")
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .expect("name hook assembly failed")
+}
+
+#[cfg(test)]
+fn build_c6ee_hook() -> Vec<u8> {
+    compile_c6ee_hook_at(ENC_HOOK_BASE).bytes().to_vec()
+}
+
+#[cfg(test)]
+fn build_name_hook(name_table_addr: u16) -> Vec<u8> {
+    let addr = ENC_HOOK_BASE + compile_c6ee_hook_at(ENC_HOOK_BASE).len() as u16;
+    compile_name_hook_at(addr, name_table_addr).bytes().to_vec()
 }
 
 // ── Main Entry Point ──────────────────────────────────────────────────
@@ -360,7 +377,7 @@ pub fn apply_encyclopedia_hooks(
     let mut count = 0;
 
     // ── 1. Build hook code ────────────────────────────────────────────
-    let c6ee_code = build_c6ee_hook();
+    let c6ee_code = compile_c6ee_hook_at(ENC_HOOK_BASE);
 
     // We need to know the name table address before building the name hook,
     // so compute all addresses first.
@@ -371,7 +388,7 @@ pub fn apply_encyclopedia_hooks(
 
     let name_hook_addr = next_addr;
     // Build name hook with a placeholder — we'll rebuild after computing table addr
-    let name_hook_placeholder = build_name_hook(0x0000);
+    let name_hook_placeholder = compile_name_hook_at(name_hook_addr, 0x0000);
     next_addr += name_hook_placeholder.len() as u16;
 
     let name_table_addr = next_addr;
@@ -391,7 +408,7 @@ pub fn apply_encyclopedia_hooks(
     }
 
     // Now rebuild name hook with the actual table address
-    let name_hook_code = build_name_hook(name_table_addr);
+    let name_hook_code = compile_name_hook_at(name_hook_addr, name_table_addr);
     assert_eq!(
         name_hook_code.len(),
         name_hook_placeholder.len(),
@@ -422,48 +439,50 @@ pub fn apply_encyclopedia_hooks(
         hooks_end - 1
     );
 
-    // ── 2. Write hook code + name table to Bank $03 free space ──────
-    {
-        let base_pc = lorom_to_pc(HOOK_BANK, ENC_HOOK_BASE);
-        let mut region = rom.region_expect(
-            base_pc,
-            total_size,
-            "encyclopedia:hook_code",
-            &Expect::FreeSpace(0xFF),
-        );
+    // ── 2. Write typed hooks and data as separate owners ─────────────
+    rom.write_machine_code_expect(
+        &c6ee_code,
+        "encyclopedia:c6ee_hook_code",
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_machine_code_expect(
+        &name_hook_code,
+        "encyclopedia:name_hook_code",
+        &Expect::FreeSpace(0xFF),
+    );
 
-        // C6EE hook
-        let c6ee_off = (c6ee_hook_addr - ENC_HOOK_BASE) as usize;
-        region.copy_at(c6ee_off, &c6ee_code);
-
-        // Name hook
-        let name_hook_off = (name_hook_addr - ENC_HOOK_BASE) as usize;
-        region.copy_at(name_hook_off, &name_hook_code);
-
-        // ── 3. Write KO name table ────────────────────────────────────
-        let table_off = (name_table_addr - ENC_HOOK_BASE) as usize;
-        for (i, name_bytes) in data.names.iter().enumerate() {
-            let entry_off = table_off + i * NAME_ENTRY_SIZE;
-            if name_bytes.len() > NAME_ENTRY_SIZE {
-                return Err(format!(
-                    "Monster #{} name too long: {} bytes (max {})",
-                    i,
-                    name_bytes.len(),
-                    NAME_ENTRY_SIZE
-                ));
-            }
-            // Fill entry with FF first, then write name bytes
-            region.data_mut()[entry_off..entry_off + NAME_ENTRY_SIZE].fill(0xFF);
-            region.copy_at(entry_off, name_bytes);
+    let mut name_table = vec![0xFF; name_table_size as usize];
+    for (i, name_bytes) in data.names.iter().enumerate() {
+        let entry_off = i * NAME_ENTRY_SIZE;
+        if name_bytes.len() > NAME_ENTRY_SIZE {
+            return Err(format!(
+                "Monster #{} name too long: {} bytes (max {})",
+                i,
+                name_bytes.len(),
+                NAME_ENTRY_SIZE
+            ));
         }
+        name_table[entry_off..entry_off + name_bytes.len()].copy_from_slice(name_bytes);
     }
+    rom.write_snes_expect(
+        HOOK_BANK,
+        name_table_addr,
+        &name_table,
+        "encyclopedia:name_table",
+        &Expect::FreeSpace(0xFF),
+    );
     println!("  Wrote {} KO monster names to table", data.names.len());
 
     // ── 4. Patch C6EE renderer at $03:$C742 ──────────────────────────
     // Replace EB A9 0F (XBA / LDA #$0F) with JMP c6ee_hook_addr (3 bytes)
-    rom.write_expect(
-        C6EE_PATCH_PC,
-        &[0x4C, c6ee_hook_addr as u8, (c6ee_hook_addr >> 8) as u8],
+    let c6ee_jump = compile_fixed_machine_code::<3>(
+        vec![Inst::JmpAbs(c6ee_hook_addr)],
+        HOOK_BANK,
+        0xC742,
+        ExecutionMode::M8X16,
+    )?;
+    rom.write_machine_code_expect(
+        &c6ee_jump,
         "encyclopedia:c6ee_jmp",
         &Expect::Bytes(&[0xEB, 0xA9, 0x0F]),
     );
@@ -475,9 +494,14 @@ pub fn apply_encyclopedia_hooks(
 
     // ── 5. Patch name display at $03:$B626 ───────────────────────────
     // Replace A0 AA 17 (LDY #$17AA) with JMP name_hook_addr (3 bytes)
-    rom.write_expect(
-        NAME_PATCH_PC,
-        &[0x4C, name_hook_addr as u8, (name_hook_addr >> 8) as u8],
+    let name_jump = compile_fixed_machine_code::<3>(
+        vec![Inst::JmpAbs(name_hook_addr)],
+        HOOK_BANK,
+        0xB626,
+        ExecutionMode::M8X16,
+    )?;
+    rom.write_machine_code_expect(
+        &name_jump,
         "encyclopedia:name_jmp",
         &Expect::Bytes(&[0xA0, 0xAA, 0x17]),
     );

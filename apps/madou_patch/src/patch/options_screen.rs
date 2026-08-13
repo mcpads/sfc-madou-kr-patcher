@@ -1,4 +1,4 @@
-//! Options / Stat / Magic screen localization .
+//! Options / Stat / Magic screen localization (Issue G/H/I).
 //!
 //! ## Screen Architecture (state machine at $01:$8069)
 //!
@@ -40,11 +40,13 @@
 //! - Tile sharing conflicts ($22A/$22B/$24E/$24F)
 //! - TM5 remap hook at $01:$8F83 for shared tile resolution
 
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{compile_jsl, compile_machine_code, ExecutionMode, Inst, MachineCode};
 use crate::patch::font;
 use crate::patch::hook_common::{self, JSL_LZ_BYTES};
 use crate::patch::tracked_rom::{Expect, TrackedRom};
+#[cfg(test)]
 use crate::rom::lorom_to_pc;
+use crate::rom::pc_to_lorom;
 
 // ── LZ pointer table (Bank $08) ────────────────────────────────────
 const LZ_PTR_BANK: u8 = 0x08;
@@ -227,6 +229,9 @@ const STAT_REGIONS: &[TextRegion] = &[
 ];
 
 /// Magic screen (TM6 right page, cols 32–63 in 64-wide space).
+const MAGIC_BRAIN_DAMNED_LABEL: &str = "브레인담드";
+const MAGIC_BRAIN_DAMNED_SLOTS: usize = 5;
+
 const MAGIC_REGIONS: &[TextRegion] = &[
     TextRegion {
         ko: "신비석",
@@ -257,11 +262,12 @@ const MAGIC_REGIONS: &[TextRegion] = &[
         col_end: 37,
     },
     TextRegion {
-        ko: "브레인담드",
+        // The following two TM6 cells are a separate field, not expandable text space.
+        ko: MAGIC_BRAIN_DAMNED_LABEL,
         size: TileSize::S8x8,
         row: 11,
         col_start: 39,
-        col_end: 44,
+        col_end: 39 + MAGIC_BRAIN_DAMNED_SLOTS,
     },
     TextRegion {
         ko: "바요히히히",
@@ -1184,12 +1190,13 @@ fn build_4bpp_overlay(
 // ── CHR hook assembly ───────────────────────────────────────────────
 
 /// Build a hook: JSL $009440 (original LZ decompress), then MVN overlay → WRAM.
-fn build_chr_hook(
+fn build_chr_hook_at(
+    code_addr: u16,
     overlay_bank: u8,
     overlay_addr: u16,
     overlay_size: u16,
     wram_dest: u16,
-) -> Result<Vec<u8>, String> {
+) -> Result<MachineCode, String> {
     if overlay_size == 0 {
         return Err("overlay_size must be > 0".into());
     }
@@ -1207,7 +1214,7 @@ fn build_chr_hook(
         Plp,
         Rtl,
     ];
-    assemble(&program)
+    compile_machine_code(program, DATA_BANK, code_addr, ExecutionMode::M8X16)
 }
 
 // ── Tilemap remap hook assembly ────────────────────────────────────
@@ -1217,7 +1224,10 @@ fn build_chr_hook(
 /// Used for both TM5 (options) and TM6 (stat+magic) remap hooks.
 /// Each remap entry preserves the original attribute bits (YXPCCC) and only
 /// changes the 10-bit tile index.
-fn build_tm_remap_hook(remap_values: &[(u16, u16)]) -> Result<Vec<u8>, String> {
+fn build_tm_remap_hook_at(
+    code_addr: u16,
+    remap_values: &[(u16, u16)],
+) -> Result<MachineCode, String> {
     use Inst::*;
     let mut program = vec![
         Jsl(0x009440), // Original LZ decompress to $7F:$C800
@@ -1236,7 +1246,29 @@ fn build_tm_remap_hook(remap_values: &[(u16, u16)]) -> Result<Vec<u8>, String> {
     program.push(Plb);
     program.push(Plp);
     program.push(Rtl);
-    assemble(&program)
+    compile_machine_code(program, DATA_BANK, code_addr, ExecutionMode::M8X16)
+}
+
+#[cfg(test)]
+fn build_chr_hook(
+    overlay_bank: u8,
+    overlay_addr: u16,
+    overlay_size: u16,
+    wram_dest: u16,
+) -> Result<Vec<u8>, String> {
+    build_chr_hook_at(
+        CODE_BASE_ADDR,
+        overlay_bank,
+        overlay_addr,
+        overlay_size,
+        wram_dest,
+    )
+    .map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_tm_remap_hook(remap_values: &[(u16, u16)]) -> Result<Vec<u8>, String> {
+    build_tm_remap_hook_at(TM6_CODE_ADDR, remap_values).map(|code| code.bytes().to_vec())
 }
 
 // ── Shared screen hook logic (Phase 2a) ─────────────────────────────
@@ -1382,7 +1414,8 @@ fn apply_screen_hook(
             config.name, overlay_size_4bpp
         )
     })?;
-    let hook = build_chr_hook(
+    let hook = build_chr_hook_at(
+        config.code_addr,
         DATA_BANK,
         overlay_rom_addr as u16,
         overlay_size_u16,
@@ -1402,29 +1435,23 @@ fn apply_screen_hook(
         data_end,
     );
 
-    let total_region = data_end - config.code_addr as usize;
-    let hook_pc = lorom_to_pc(DATA_BANK, config.code_addr);
-    {
-        let mut r = rom.region_expect(
-            hook_pc,
-            total_region,
-            &format!("options:{}", config.name),
-            &Expect::FreeSpace(0xFF),
-        );
-        r.copy_at(0, &hook);
-        let overlay_off = overlay_rom_addr - config.code_addr as usize;
-        r.copy_at(overlay_off, &overlay_4bpp);
-    }
+    rom.write_machine_code_expect(
+        &hook,
+        &format!("options:{}_code", config.name),
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_snes_expect(
+        DATA_BANK,
+        overlay_rom_addr as u16,
+        &overlay_4bpp,
+        &format!("options:{}_overlay", config.name),
+        &Expect::FreeSpace(0xFF),
+    );
 
     // 10. Patch JSL site
-    let jsl = [
-        0x22u8,
-        hook_snes as u8,
-        (hook_snes >> 8) as u8,
-        (hook_snes >> 16) as u8,
-    ];
-    rom.write_expect(
-        config.hook_pc,
+    let site = pc_to_lorom(config.hook_pc);
+    let jsl = compile_jsl(site.bank, site.addr, hook_snes, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
         &jsl,
         &format!("options:{}_jsl", config.name),
         &Expect::Bytes(&JSL_LZ_BYTES),
@@ -1493,7 +1520,7 @@ pub fn apply_options_screen_hook(
         tm6_remap_values.push((wram_addr, new_entry));
     }
 
-    let tm6_hook = build_tm_remap_hook(&tm6_remap_values)?;
+    let tm6_hook = build_tm_remap_hook_at(TM6_CODE_ADDR, &tm6_remap_values)?;
     println!(
         "  TM6 remap hook: {} entries, {} bytes",
         TM6_REMAPS.len(),
@@ -1509,30 +1536,19 @@ pub fn apply_options_screen_hook(
         ));
     }
 
-    // Write TM6 hook to Bank $1C
-    let tm6_hook_pc = lorom_to_pc(DATA_BANK, TM6_CODE_ADDR);
-    rom.region_expect(
-        tm6_hook_pc,
-        tm6_hook.len(),
-        "options:tm6_remap",
-        &Expect::FreeSpace(0xFF),
-    )
-    .copy_at(0, &tm6_hook);
+    // Write typed TM6 hook to Bank $1C.
+    rom.write_machine_code_expect(&tm6_hook, "options:tm6_remap", &Expect::FreeSpace(0xFF));
 
     // Patch TM6 JSL site
     let tm6_hook_snes = (DATA_BANK as u32) << 16 | TM6_CODE_ADDR as u32;
-    let jsl_tm6 = [
-        0x22u8,
-        tm6_hook_snes as u8,
-        (tm6_hook_snes >> 8) as u8,
-        (tm6_hook_snes >> 16) as u8,
-    ];
-    rom.write_expect(
-        TM6_HOOK_PC,
-        &jsl_tm6,
-        "options:tm6_jsl",
-        &Expect::Bytes(&JSL_LZ_BYTES),
-    );
+    let tm6_site = pc_to_lorom(TM6_HOOK_PC);
+    let jsl_tm6 = compile_jsl(
+        tm6_site.bank,
+        tm6_site.addr,
+        tm6_hook_snes,
+        ExecutionMode::M8X16,
+    )?;
+    rom.write_machine_code_expect(&jsl_tm6, "options:tm6_jsl", &Expect::Bytes(&JSL_LZ_BYTES));
     println!(
         "  JSL: TM6 (PC 0x{:05X}) → ${:06X}, end ${:04X}",
         TM6_HOOK_PC,
@@ -1724,8 +1740,8 @@ pub fn apply_options_phase2b(
         let wram_addr = TM5_WRAM_BASE + ((row * TM5_COLS + col) * 2) as u16;
         remap_values.push((wram_addr, new_entry));
     }
-    let tm5_hook = build_tm_remap_hook(&remap_values)?;
     let tm5_code_addr = chr_data_end as u16;
+    let tm5_hook = build_tm_remap_hook_at(tm5_code_addr, &remap_values)?;
     let tm5_data_end = tm5_code_addr as usize + tm5_hook.len();
 
     if tm5_data_end > 0xFFFF {
@@ -1735,11 +1751,11 @@ pub fn apply_options_phase2b(
         ));
     }
 
-    // 9. Write CHR hook + overlay + TM5 hook to Bank $1C (single region)
-    let total_region_len = tm5_data_end - OPT_CODE_ADDR as usize;
+    // 9. Write typed hooks and overlay as separate owners.
     let overlay_size_u16 = u16::try_from(overlay_size_4bpp)
         .map_err(|_| format!("Options: overlay size {} exceeds u16", overlay_size_4bpp))?;
-    let chr_hook = build_chr_hook(
+    let chr_hook = build_chr_hook_at(
+        OPT_CODE_ADDR,
         DATA_BANK,
         chr_overlay_rom_addr as u16,
         overlay_size_u16,
@@ -1766,28 +1782,33 @@ pub fn apply_options_phase2b(
         tm5_data_end,
     );
 
-    let base_pc = lorom_to_pc(DATA_BANK, OPT_CODE_ADDR);
-    {
-        let mut r = rom.region_expect(
-            base_pc,
-            total_region_len,
-            "options:phase2b",
-            &Expect::FreeSpace(0xFF),
-        );
-        r.copy_at(0, &chr_hook);
-        r.copy_at(chr_overlay_rom_addr - OPT_CODE_ADDR as usize, &overlay_4bpp);
-        r.copy_at(tm5_code_addr as usize - OPT_CODE_ADDR as usize, &tm5_hook);
-    }
+    rom.write_machine_code_expect(
+        &chr_hook,
+        "options:phase2b_chr_code",
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_snes_expect(
+        DATA_BANK,
+        chr_overlay_rom_addr as u16,
+        &overlay_4bpp,
+        "options:phase2b_overlay",
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_machine_code_expect(
+        &tm5_hook,
+        "options:phase2b_tm5_code",
+        &Expect::FreeSpace(0xFF),
+    );
 
     // 10. Patch CHR hook site ($01:$8F46)
-    let jsl_chr = [
-        0x22u8,
-        chr_hook_snes as u8,
-        (chr_hook_snes >> 8) as u8,
-        (chr_hook_snes >> 16) as u8,
-    ];
-    rom.write_expect(
-        OPT_CHR_HOOK_PC,
+    let chr_site = pc_to_lorom(OPT_CHR_HOOK_PC);
+    let jsl_chr = compile_jsl(
+        chr_site.bank,
+        chr_site.addr,
+        chr_hook_snes,
+        ExecutionMode::M8X16,
+    )?;
+    rom.write_machine_code_expect(
         &jsl_chr,
         "options:phase2b_chr_jsl",
         &Expect::Bytes(&JSL_LZ_BYTES),
@@ -1798,14 +1819,14 @@ pub fn apply_options_phase2b(
     );
 
     // 11. Patch TM5 hook site ($01:$8F83)
-    let jsl_tm5 = [
-        0x22u8,
-        tm5_hook_snes as u8,
-        (tm5_hook_snes >> 8) as u8,
-        (tm5_hook_snes >> 16) as u8,
-    ];
-    rom.write_expect(
-        OPT_TM5_HOOK_PC,
+    let tm5_site = pc_to_lorom(OPT_TM5_HOOK_PC);
+    let jsl_tm5 = compile_jsl(
+        tm5_site.bank,
+        tm5_site.addr,
+        tm5_hook_snes,
+        ExecutionMode::M8X16,
+    )?;
+    rom.write_machine_code_expect(
         &jsl_tm5,
         "options:phase2b_tm5_jsl",
         &Expect::Bytes(&JSL_LZ_BYTES),

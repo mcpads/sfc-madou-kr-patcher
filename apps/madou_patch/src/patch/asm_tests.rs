@@ -67,13 +67,6 @@ fn lda_abs_encoding() {
 }
 
 #[test]
-fn raw_bytes() {
-    let prog = vec![RawBytes(vec![0x4C, 0x00, 0x80])]; // JMP $8000
-    let bytes = assemble(&prog).unwrap();
-    assert_eq!(bytes, vec![0x4C, 0x00, 0x80]);
-}
-
-#[test]
 fn bmi_encoding() {
     let prog = vec![Bmi("target"), Rtl, Label("target"), Rtl];
     let bytes = assemble(&prog).unwrap();
@@ -129,13 +122,20 @@ fn adc_sbc_eor_encoding() {
     assert_eq!(
         assemble(&[
             AdcImm8(0x0A),
+            Rep(0x20),
             AdcImm16(0x6400),
+            Sep(0x20),
             SbcImm8(0x14),
+            Rep(0x20),
             SbcImm16(0x1234),
+            Sep(0x20),
             EorImm8(0xFF)
         ])
         .unwrap(),
-        vec![0x69, 0x0A, 0x69, 0x00, 0x64, 0xE9, 0x14, 0xE9, 0x34, 0x12, 0x49, 0xFF]
+        vec![
+            0x69, 0x0A, 0xC2, 0x20, 0x69, 0x00, 0x64, 0xE2, 0x20, 0xE9, 0x14, 0xC2, 0x20, 0xE9,
+            0x34, 0x12, 0xE2, 0x20, 0x49, 0xFF
+        ]
     );
 }
 

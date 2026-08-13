@@ -179,8 +179,11 @@ pub fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
                 // SourceRead
                 for i in 0..length {
                     let src_idx = output_offset + i;
-                    target[output_offset + i] =
-                        if src_idx < source.len() { source[src_idx] } else { 0 };
+                    target[output_offset + i] = if src_idx < source.len() {
+                        source[src_idx]
+                    } else {
+                        0
+                    };
                 }
                 output_offset += length;
             }
@@ -209,7 +212,9 @@ pub fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
                 {
                     return Err(format!(
                         "SourceCopy out of bounds (offset={}, length={}, source_len={})",
-                        source_relative_offset, length, source.len()
+                        source_relative_offset,
+                        length,
+                        source.len()
                     ));
                 }
                 for _ in 0..length {
@@ -225,12 +230,11 @@ pub fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
                 let sign = if offset_data & 1 != 0 { -1i64 } else { 1i64 };
                 let abs_offset = (offset_data >> 1) as i64;
                 target_relative_offset += sign * abs_offset;
-                if target_relative_offset < 0
-                    || target_relative_offset as usize >= target.len()
-                {
+                if target_relative_offset < 0 || target_relative_offset as usize >= target.len() {
                     return Err(format!(
                         "TargetCopy out of bounds (offset={}, target_len={})",
-                        target_relative_offset, target.len()
+                        target_relative_offset,
+                        target.len()
                     ));
                 }
                 for _ in 0..length {
@@ -244,8 +248,11 @@ pub fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // Verify target CRC
-    let stored_target_crc =
-        u32::from_le_bytes(patch[footer_start + 4..footer_start + 8].try_into().unwrap());
+    let stored_target_crc = u32::from_le_bytes(
+        patch[footer_start + 4..footer_start + 8]
+            .try_into()
+            .unwrap(),
+    );
     let actual_target_crc = crc32fast::hash(&target);
     if stored_target_crc != actual_target_crc {
         return Err(format!(

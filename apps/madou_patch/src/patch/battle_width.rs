@@ -1,4 +1,4 @@
-//! Battle dialog box width/height dynamic hook .
+//! Battle dialog box width/height dynamic hook (Issue K).
 //!
 //! The battle script command $48 hardcodes width/height for each text box.
 //! KO translations may have different character counts than JP originals.
@@ -13,9 +13,10 @@
 //! Hook site: $03:$9D84 (12 bytes: LDA/STA ×2 for slot+$06 and slot+$08)
 //! Hook code: Bank $03:$FB00+ (~140 bytes)
 
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{
+    compile_fixed_machine_code, compile_machine_code, ExecutionMode, Inst, MachineCode,
+};
 use crate::patch::tracked_rom::{Expect, TrackedRom};
-use crate::rom::lorom_to_pc;
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -34,7 +35,6 @@ const MAX_WIDTH: u8 = 0x1E;
 const RIGHT_LIMIT: u8 = 30;
 
 /// Hook site: $03:$9D84 (PC offset).
-const HOOK_SITE_PC: usize = lorom_to_pc(HOOK_BANK, 0x9D84);
 /// Original bytes at hook site (LDA $0001,Y + STA $0006,X + LDA $0003,Y + STA $0008,X).
 const HOOK_SITE_ORIGINAL: [u8; 12] = [
     0xB9, 0x01, 0x00, // LDA $0001,Y (width|height)
@@ -64,7 +64,7 @@ const DP_HEIGHT: u8 = 0x10; // dp$10: line count
 ///   Y+6,7  text addr lo/hi → slot+$0B,$0C
 ///   Y+8    text bank       → slot+$0D
 ///   Y+9    extra param     → slot+$18
-pub fn build_scan_hook() -> Vec<u8> {
+fn compile_scan_hook() -> MachineCode {
     use Inst::*;
     let program = vec![
         // ── Save registers ──
@@ -98,7 +98,7 @@ pub fn build_scan_hook() -> Vec<u8> {
         Bcc("done"), // $F8 → page break (terminator)
         Beq("nl"),   // $F9 → newline
         CmpImm8(0xFC),
-        Bcc("prefix"), // $FA-$FB → prefix
+        Bcc("prefix"),  // $FA-$FB → prefix
         Beq("fc_skip"), // $FC → box/speaker control (2 bytes, skip)
         CmpImm8(0xFE),
         Bcc("fd_skip"), // $FD → choice marker (1 byte, 0 width)
@@ -118,7 +118,7 @@ pub fn build_scan_hook() -> Vec<u8> {
         Label("width_check"),
         LdaDp(DP_CUR_W),
         CmpImm8(MAX_WIDTH),
-        Bcs("done"),   // cur_width >= MAX → stop scanning
+        Bcs("done"), // cur_width >= MAX → stop scanning
         Bra("scan"),
         // ── FC box/speaker control (2 bytes, 0 width) ──
         Label("fc_skip"),
@@ -161,60 +161,80 @@ pub fn build_scan_hook() -> Vec<u8> {
         // Each width unit = 2 tilemap columns (16px = 1 KO char).
         // If col + ko_width*2 > RIGHT_LIMIT, shift dp left by excess.
         // dp$0B-$0D free (text scan done), dp$0E=ko_width, dp$0F/dp$10 free.
-        LdaAbsY(0x0003),   // original display_params (16-bit, M=0)
-        StaDp(DP_PTR),      // dp$0B:$0C = dp_orig
-        Sep(0x20),          // M=1, 8-bit A
-        LdaDp(DP_PTR),      // A = dp_orig lo byte
-        AndImm8(0x1F),      // column = dp_orig & 31 (tilemap 32 cols/row)
+        LdaAbsY(0x0003), // original display_params (16-bit, M=0)
+        StaDp(DP_PTR),   // dp$0B:$0C = dp_orig
+        Sep(0x20),       // M=1, 8-bit A
+        LdaDp(DP_PTR),   // A = dp_orig lo byte
+        AndImm8(0x1F),   // column = dp_orig & 31 (tilemap 32 cols/row)
         Clc,
-        AdcDp(DP_MAX_W),    // col + ko_width (max 31+30=61, no carry)
-        AdcDp(DP_MAX_W),    // col + ko_width*2 = right_edge (max 91, no carry)
+        AdcDp(DP_MAX_W),          // col + ko_width (max 31+30=61, no carry)
+        AdcDp(DP_MAX_W),          // col + ko_width*2 = right_edge (max 91, no carry)
         CmpImm8(RIGHT_LIMIT + 1), // right_edge > RIGHT_LIMIT?
-        Bcc("no_shift"),    // ≤ RIGHT_LIMIT → copy dp unchanged
+        Bcc("no_shift"),          // ≤ RIGHT_LIMIT → copy dp unchanged
         // ── Shift left by excess ──
         Sec,
         SbcImm8(RIGHT_LIMIT), // excess = right_edge - RIGHT_LIMIT
         StaDp(DP_PTR + 2),    // dp$0D = excess (lo)
         StzDp(DP_MAX_W),      // dp$0E = 0 (zero-extend to 16-bit)
-        Rep(0x20),             // 16-bit A
+        Rep(0x20),            // 16-bit A
         LdaDp(DP_PTR),        // dp_orig (16-bit)
         Sec,
-        SbcDp(DP_PTR + 2),    // dp_orig - excess (16-bit subtract)
-        StaAbsX(0x0008),      // slot+$08 = adjusted dp
+        SbcDp(DP_PTR + 2), // dp_orig - excess (16-bit subtract)
+        StaAbsX(0x0008),   // slot+$08 = adjusted dp
         Rtl,
         // ── No shift needed ──
         Label("no_shift"),
-        Rep(0x20),             // 16-bit A
-        LdaDp(DP_PTR),        // dp_orig unchanged
-        StaAbsX(0x0008),      // slot+$08
+        Rep(0x20),       // 16-bit A
+        LdaDp(DP_PTR),   // dp_orig unchanged
+        StaAbsX(0x0008), // slot+$08
         Rtl,
     ];
 
-    assemble(&program).expect("battle width hook assembly failed")
+    compile_machine_code(program, HOOK_BANK, HOOK_BASE, ExecutionMode::M16X16)
+        .expect("battle width hook assembly failed")
+}
+
+#[cfg(test)]
+pub fn build_scan_hook() -> Vec<u8> {
+    compile_scan_hook().bytes().to_vec()
 }
 
 /// Build the 12-byte hook site patch (JSL + 8×NOP).
 ///
 /// Replaces both LDA/STA pairs at `$9D84`-`$9D8F`.
 /// The hook handles both slot+$06 and slot+$08 writes internally.
-pub fn build_hook_site_patch(hook_addr: u16) -> Vec<u8> {
+fn compile_hook_site_patch(hook_addr: u16) -> MachineCode {
     let long_addr = (HOOK_BANK as u32) << 16 | hook_addr as u32;
-    vec![
-        0x22, // JSL
-        long_addr as u8,
-        (long_addr >> 8) as u8,
-        (long_addr >> 16) as u8,
-        0xEA, 0xEA, 0xEA, 0xEA, // NOP ×4
-        0xEA, 0xEA, 0xEA, 0xEA, // NOP ×4
-    ]
+    compile_fixed_machine_code::<12>(
+        vec![
+            Inst::Jsl(long_addr),
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+            Inst::Nop,
+        ],
+        HOOK_BANK,
+        0x9D84,
+        ExecutionMode::M16X16,
+    )
+    .expect("battle width hook-site assembly failed")
+}
+
+#[cfg(test)]
+pub fn build_hook_site_patch(hook_addr: u16) -> Vec<u8> {
+    compile_hook_site_patch(hook_addr).bytes().to_vec()
 }
 
 /// Apply the battle width/height hook to the ROM.
 pub fn apply_battle_width_hook(rom: &mut TrackedRom) -> Result<(), String> {
-    let hook_code = build_scan_hook();
+    let hook_code = compile_scan_hook();
     let hook_size = hook_code.len();
 
-    println!("\n--- Applying battle width hook  ---");
+    println!("\n--- Applying battle width hook (Issue K) ---");
     println!(
         "  Hook code: {} bytes at ${:02X}:${:04X}",
         hook_size, HOOK_BANK, HOOK_BASE
@@ -230,19 +250,15 @@ pub fn apply_battle_width_hook(rom: &mut TrackedRom) -> Result<(), String> {
     }
 
     // Write hook code to Bank $03 free space
-    let hook_pc = lorom_to_pc(HOOK_BANK, HOOK_BASE);
-    rom.region_expect(
-        hook_pc,
-        hook_size,
+    rom.write_machine_code_expect(
+        &hook_code,
         "battle_width:hook_code",
         &Expect::FreeSpace(0xFF),
-    )
-    .copy_at(0, &hook_code);
+    );
 
     // Patch hook site: replace LDA+STA with JSL+NOP+NOP
-    let site_patch = build_hook_site_patch(HOOK_BASE);
-    rom.write_expect(
-        HOOK_SITE_PC,
+    let site_patch = compile_hook_site_patch(HOOK_BASE);
+    rom.write_machine_code_expect(
         &site_patch,
         "battle_width:hook_site",
         &Expect::Bytes(&HOOK_SITE_ORIGINAL),
@@ -252,7 +268,10 @@ pub fn apply_battle_width_hook(rom: &mut TrackedRom) -> Result<(), String> {
         "  Hook site: ${:02X}:${:04X} (12 bytes: JSL ${:02X}:${:04X} + NOP×8)",
         HOOK_BANK, 0x9D84, HOOK_BANK, HOOK_BASE
     );
-    println!("  display_params: screen-boundary clamping (RIGHT_LIMIT={})", RIGHT_LIMIT);
+    println!(
+        "  display_params: screen-boundary clamping (RIGHT_LIMIT={})",
+        RIGHT_LIMIT
+    );
 
     Ok(())
 }

@@ -1,8 +1,10 @@
 //! Character width calculation and line/page layout for text box simulation.
 
 use crate::encoding::codec::{ControlCode, GameChar, Token};
+use crate::text::control::{LineWrapMode, TextBoxProfile};
 
 /// Text box width (in 8x8 tile units).
+#[cfg(test)]
 pub const BOX_WIDTH_TILES: usize = 20;
 /// Default text box lines (dialogue/battle). Diary uses 5 — see BankConfig.box_lines.
 #[cfg(test)]
@@ -39,12 +41,18 @@ pub struct RenderResult {
 /// Render a token stream into pages with default BOX_LINES (3) limit.
 #[cfg(test)]
 pub fn render_pages(tokens: &[Token]) -> RenderResult {
-    render_pages_with_limit(tokens, BOX_LINES)
+    render_pages_with_profile(
+        tokens,
+        TextBoxProfile {
+            max_width_tiles: BOX_WIDTH_TILES,
+            max_lines: BOX_LINES,
+            wrap_mode: LineWrapMode::Automatic,
+        },
+    )
 }
 
-/// Render a token stream into pages with line wrapping.
-/// `max_lines` overrides the default BOX_LINES (3) for per-bank limits (e.g. diary = 5).
-pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResult {
+/// Render a token stream using the limits of its concrete text consumer.
+pub fn render_pages_with_profile(tokens: &[Token], profile: TextBoxProfile) -> RenderResult {
     let mut pages: Vec<Page> = Vec::new();
     let mut current_lines: Vec<Line> = Vec::new();
     let mut current_line = Line {
@@ -64,7 +72,7 @@ pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResu
                     width: 0,
                 };
                 // Check for line overflow within a page
-                if current_lines.len() > max_lines {
+                if current_lines.len() > profile.max_lines {
                     overflow = true;
                 }
             }
@@ -95,7 +103,9 @@ pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResu
             }
             Token::Control(ControlCode::Space) => {
                 let w = 2; // 16×16 rendered space = 2 tile columns
-                if current_line.width + w > BOX_WIDTH_TILES {
+                if profile.wrap_mode == LineWrapMode::Automatic
+                    && current_line.width + w > profile.max_width_tiles
+                {
                     // Wrap
                     current_lines.push(current_line);
                     current_line = Line {
@@ -108,7 +118,9 @@ pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResu
             }
             Token::Char(gc, _) => {
                 let w = char_width(gc);
-                if current_line.width + w > BOX_WIDTH_TILES {
+                if profile.wrap_mode == LineWrapMode::Automatic
+                    && current_line.width + w > profile.max_width_tiles
+                {
                     // Wrap to next line
                     current_lines.push(current_line);
                     current_line = Line {
@@ -121,7 +133,9 @@ pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResu
             }
             Token::Unknown(_) | Token::UnknownFb(_) => {
                 let w = 2; // 16×16 rendered = 2 tile columns
-                if current_line.width + w > BOX_WIDTH_TILES {
+                if profile.wrap_mode == LineWrapMode::Automatic
+                    && current_line.width + w > profile.max_width_tiles
+                {
                     current_lines.push(current_line);
                     current_line = Line {
                         tokens: Vec::new(),
@@ -147,19 +161,19 @@ pub fn render_pages_with_limit(tokens: &[Token], max_lines: usize) -> RenderResu
 
     // Check for overflow on each page
     for page in &pages {
-        if page.lines.len() > max_lines {
+        if page.lines.len() > profile.max_lines {
             overflow = true;
             overflow_chars += page
                 .lines
                 .iter()
-                .skip(max_lines)
+                .skip(profile.max_lines)
                 .map(|l| l.tokens.len())
                 .sum::<usize>();
         }
         for line in &page.lines {
-            if line.width > BOX_WIDTH_TILES {
+            if line.width > profile.max_width_tiles {
                 overflow = true;
-                overflow_chars += line.width - BOX_WIDTH_TILES;
+                overflow_chars += line.width - profile.max_width_tiles;
             }
         }
     }

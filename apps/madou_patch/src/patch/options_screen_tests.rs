@@ -257,6 +257,18 @@ fn all_regions_have_valid_ko_text() {
     }
 }
 
+#[test]
+fn brain_damned_uses_the_only_five_magic_screen_slots() {
+    assert_eq!(
+        MAGIC_BRAIN_DAMNED_LABEL.chars().count(),
+        MAGIC_BRAIN_DAMNED_SLOTS,
+    );
+    assert!(
+        "브레인다므드".chars().count() > MAGIC_BRAIN_DAMNED_SLOTS,
+        "canonical spelling must not overwrite the adjacent TM6 field",
+    );
+}
+
 // ── Direct tile mapping validation ──────────────────────────────────
 
 #[test]

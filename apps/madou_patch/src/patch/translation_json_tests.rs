@@ -248,3 +248,57 @@ fn load_bank_json_optional_fields() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn load_bank_json_rejects_fixed_menu_row_overflow() {
+    let dir = std::env::temp_dir().join("madou_test_json_fixed_menu_overflow");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let json = r#"{
+        "bank": "01",
+        "entries": [
+            {
+                "addr": "$01:B640",
+                "jp": "test",
+                "ko": "이{NL}이이이이이이이이이이이"
+            }
+        ]
+    }"#;
+    std::fs::write(dir.join("bank_01_01.json"), json).unwrap();
+
+    let ko = test_ko_table();
+    let result = load_bank_json_chunks(&dir, "01", &ko, false);
+
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.contains("$01:B640"));
+    assert!(error.contains("width 22 tiles"));
+    assert!(error.contains("limit 20 tiles × 2 lines"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_bank_json_accepts_full_fixed_menu_grid() {
+    let dir = std::env::temp_dir().join("madou_test_json_fixed_menu_fit");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let json = r#"{
+        "bank": "01",
+        "entries": [
+            {
+                "addr": "$01:B640",
+                "jp": "test",
+                "ko": "이이이이이이이이이이{NL}이이이이이이이이이이"
+            }
+        ]
+    }"#;
+    std::fs::write(dir.join("bank_01_01.json"), json).unwrap();
+
+    let ko = test_ko_table();
+    let entries = load_bank_json_chunks(&dir, "01", &ko, false).unwrap();
+
+    assert_eq!(entries.len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -4,10 +4,11 @@
 
 use crate::encoding::ko;
 use crate::font_gen;
+use crate::patch::asm::{compile_fixed_machine_code, ExecutionMode, Inst};
 use crate::patch::tracked_rom::TrackedRom;
 use crate::patch::{
     battle_width, choice_highlight, encyclopedia, engine_hooks, equip_oam, font, item,
-    options_screen, relocate, savemenu, shop_oam, text, translation_json, worldmap,
+    options_screen, relocate, savemenu, shop_oam, text, title_screen, translation_json, worldmap,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +44,9 @@ pub struct PatchConfig<'a> {
     pub charset_path: Option<PathBuf>,
     pub worldmap_ttf_path: Option<PathBuf>,
     pub worldmap_ttf_size: f32,
+    pub title_main_path: Option<PathBuf>,
+    pub title_hanamaru_path: Option<PathBuf>,
+    pub title_subtitle_path: Option<PathBuf>,
 }
 
 /// (font_16x16_data, fixed_data, ko_encoding_table)
@@ -97,6 +101,7 @@ fn resolve_font_data(cfg: &PatchConfig) -> Result<FontDataBundle, String> {
 /// Run the full patch pipeline.
 pub fn run_patch(cfg: &PatchConfig) -> Result<(), String> {
     let rom_data = fs::read(cfg.rom_path).map_err(|e| format!("Failed to read ROM: {}", e))?;
+    crate::patch::source::verify_source_rom(&rom_data)?;
     let mut rom = TrackedRom::new(rom_data.clone());
 
     println!("Base ROM: {} ({} bytes)", cfg.rom_path.display(), rom.len());
@@ -126,7 +131,7 @@ pub fn run_patch(cfg: &PatchConfig) -> Result<(), String> {
             let f0_count = font::patch_fa_f0(&mut rom, font_data)?;
             println!("  Wrote {} F0 tiles (+ 256 FA)", f0_count);
 
-            // Remap 12 JP-blank FB tile slots → F0 prefix 
+            // Remap 12 JP-blank FB tile slots → F0 prefix (Issue A fix)
             println!("\n--- Remapping FB blank slots → F0 (VRAM leak fix) ---");
             let remap_end = font::patch_fb_blank_remap(&mut rom, font_data, f0_count)?;
 
@@ -253,62 +258,87 @@ pub fn run_patch(cfg: &PatchConfig) -> Result<(), String> {
         let sky_tiles = prepare_sky_tiles(cfg, ko_table.as_ref())?;
         let count = worldmap::apply_worldmap_hook(&mut rom, &sky_tiles)?;
         println!("  Hooked {} LZ conditions", count);
+
+        match (
+            cfg.title_main_path.as_deref(),
+            cfg.title_hanamaru_path.as_deref(),
+            cfg.title_subtitle_path.as_deref(),
+        ) {
+            (Some(main), Some(hanamaru), Some(subtitle)) => {
+                println!("\n--- Patching Korean title screen ---");
+                let stats = title_screen::apply_title_screen(&mut rom, main, hanamaru, subtitle)?;
+                println!(
+                    "  Main: {}×{} px, BG1 {} tiles, BG3 {} tiles; subtitle {} tiles",
+                    stats.main_width,
+                    stats.main_height,
+                    stats.bg1_tiles,
+                    stats.bg3_tiles,
+                    stats.subtitle_tiles,
+                );
+            }
+            (None, None, None) => {
+                println!("\n--- Korean title screen: SKIPPED (no PNG assets) ---")
+            }
+            _ => {
+                return Err(
+                    "Title patch requires --title-main, --title-hanamaru, and --title-subtitle"
+                        .to_string(),
+                );
+            }
+        }
     }
 
-    // Save menu UI localization 
+    // Save menu UI localization (Issue E: LZ tile replacement)
     if cfg.engine_hooks {
         patch_save_menu(&mut rom, cfg)?;
     }
 
-    // Options/stat/magic screen localization 
+    // Options/stat/magic screen localization (Issue G/H/I: LZ tile replacement)
     if cfg.engine_hooks {
         patch_options_screen(&mut rom, cfg)?;
     }
 
-    // Equipment OAM sprites 
+    // Equipment OAM sprites (Issue P: equipment name + そうび text)
     if cfg.engine_hooks {
         patch_equip_oam(&mut rom, cfg)?;
     }
 
-    // Shop OAM sprites 
+    // Shop OAM sprites (Issue U: HITL-dependent)
     if cfg.engine_hooks {
         patch_shop_oam(&mut rom, cfg)?;
     }
 
-    // Battle dialog box width/height hook 
+    // Battle dialog box width/height hook (Issue K)
     if cfg.engine_hooks {
         battle_width::apply_battle_width_hook(&mut rom)?;
     }
 
-    // Choice highlight width fix 
+    // Choice highlight width fix (Issue V)
     if cfg.engine_hooks {
         choice_highlight::apply_choice_highlight_fix(&mut rom)?;
     }
 
-    // Verify no ROM region collisions (hard error)
-    rom.check()?;
-    // Warn about untracked writes
-    if let Err(report) = rom.check_untracked_writes(&rom_data) {
-        eprintln!("\nWARNING: {}", report);
-    }
+    // Validate the full Expected Write plan, then recreate output from source.
+    let patched_rom = rom.finish()?;
 
     // Write output
     if let Some(parent) = cfg.output_path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(cfg.output_path, &*rom).map_err(|e| format!("Failed to write output ROM: {}", e))?;
+    fs::write(cfg.output_path, &patched_rom)
+        .map_err(|e| format!("Failed to write output ROM: {}", e))?;
 
     println!(
         "\n=== Patched ROM written: {} ({} bytes) ===",
         cfg.output_path.display(),
-        rom.len()
+        patched_rom.len()
     );
 
-    if rom.len() != rom_data.len() {
+    if patched_rom.len() != rom_data.len() {
         println!(
             "  WARNING: ROM size changed! {} -> {}",
             rom_data.len(),
-            rom.len()
+            patched_rom.len()
         );
     }
 
@@ -345,7 +375,7 @@ fn patch_code_embedded_strings(
         0
     };
 
-    let byte_count = patch_code_byte_patches(rom);
+    let byte_count = patch_code_byte_patches(rom)?;
     println!(
         "  Patched {} encoded + {} byte-level string(s)",
         encoded_count, byte_count
@@ -353,12 +383,12 @@ fn patch_code_embedded_strings(
     Ok(())
 }
 
-/// Apply save menu UI localization .
+/// Apply save menu UI localization (Issue E: LZ tile replacement).
 /// Uses --ttf (Galmuri11 등 픽셀폰트 권장).
 fn patch_save_menu(rom: &mut TrackedRom, cfg: &PatchConfig) -> Result<(), String> {
     let ttf_path = cfg.ttf_path.as_ref().ok_or("Save menu requires --ttf")?;
 
-    println!("\n--- Patching save menu UI  ---");
+    println!("\n--- Patching save menu UI (Issue E) ---");
     println!("  Font: {} (size {})", ttf_path.display(), cfg.ttf_size);
 
     let ttf_data = fs::read(ttf_path).map_err(|e| format!("Failed to read TTF: {}", e))?;
@@ -444,14 +474,14 @@ fn prepare_sky_tiles(
     Ok(tiles)
 }
 
-/// Apply menu worldmap localization .
+/// Apply menu worldmap localization (Issue D extension: $03:$C3F0 LZ intercept).
 /// Returns the align16 end address in Bank $32 (for pipeline chain).
 fn patch_menu_worldmap(
     rom: &mut TrackedRom,
     cfg: &PatchConfig,
     menu_code_addr: u16,
 ) -> Result<u16, String> {
-    println!("\n--- Patching menu worldmap place names  ---");
+    println!("\n--- Patching menu worldmap place names (Issue D) ---");
 
     let (ttf_data, ttf_size, font_name) = load_worldmap_8x8_font(cfg)?;
 
@@ -511,11 +541,11 @@ fn patch_menu_worldmap(
     )
 }
 
-/// Apply options/stat/magic screen localization .
+/// Apply options/stat/magic screen localization (Issue G/H/I: LZ tile replacement).
 /// 8×8: dalmoori.ttf (same priority as menu worldmap).
 /// 16×16: --savemenu-ttf > --ttf (same as save menu).
 fn patch_options_screen(rom: &mut TrackedRom, cfg: &PatchConfig) -> Result<(), String> {
-    println!("\n--- Patching options/stat/magic screens  ---");
+    println!("\n--- Patching options/stat/magic screens (Issue G/H/I) ---");
 
     // 8×8 font: --worldmap-ttf > dalmoori > --ttf (same as worldmap/equip/shop)
     let (ttf_8, size_8, name_8) = load_worldmap_8x8_font(cfg)?;
@@ -564,24 +594,24 @@ fn patch_options_screen(rom: &mut TrackedRom, cfg: &PatchConfig) -> Result<(), S
     options_screen::apply_options_phase2b(rom, &opt_tiles_8, &opt_tiles_16)
 }
 
-/// Apply equipment OAM sprite localization .
+/// Apply equipment OAM sprite localization (Issue P).
 ///
 /// Uses dalmoori 8×8 font (same as worldmap/options/shop) for pixel-perfect 8×8 OAM tiles.
 fn patch_equip_oam(rom: &mut TrackedRom, cfg: &PatchConfig) -> Result<(), String> {
     let (ttf_data, ttf_size, font_name) = load_worldmap_8x8_font(cfg)?;
 
-    println!("\n--- Patching equipment OAM sprites  ---");
+    println!("\n--- Patching equipment OAM sprites (Issue P) ---");
     println!("  Font: {} (size {})", font_name, ttf_size);
     equip_oam::apply_equip_oam_hook(rom, &ttf_data, ttf_size)
 }
 
-/// Apply shop OAM sprite localization .
+/// Apply shop OAM sprite localization (Issue U).
 ///
 /// Uses dalmoori 8×8 font (same as worldmap/options) for pixel-perfect 8×8 OAM tiles.
 fn patch_shop_oam(rom: &mut TrackedRom, cfg: &PatchConfig) -> Result<(), String> {
     let (ttf_data, ttf_size, font_name) = load_worldmap_8x8_font(cfg)?;
 
-    println!("\n--- Patching shop OAM sprites  ---");
+    println!("\n--- Patching shop OAM sprites (Issue U) ---");
     println!("  Font: {} (size {})", font_name, ttf_size);
     shop_oam::apply_shop_oam_hook(rom, &ttf_data, ttf_size)
 }
@@ -828,7 +858,7 @@ fn patch_stat_level_bar(
 
 /// Apply byte-level patches for encyclopedia "unconfirmed" placeholder.
 /// These are JP byte substitutions, not KO text encoding.
-fn patch_code_byte_patches(rom: &mut TrackedRom) -> usize {
+fn patch_code_byte_patches(rom: &mut TrackedRom) -> Result<usize, String> {
     let mut count = 0;
 
     // $03:$B6B2-$B6E9: Encyclopedia unconfirmed stats — C7(？) → 0E(?)
@@ -858,11 +888,28 @@ fn patch_code_byte_patches(rom: &mut TrackedRom) -> usize {
     // KO renders $5B as "들" (plural) — remove entirely.
     let suffix_pc = 0xAE89; // lorom_to_pc(0x01, 0xAE89)
     if suffix_pc + 6 <= rom.len() {
-        rom.fill(suffix_pc, 6, 0xEA, "code_byte:battle_suffix");
+        let suffix_patch = compile_fixed_machine_code::<6>(
+            vec![
+                Inst::Nop,
+                Inst::Nop,
+                Inst::Nop,
+                Inst::Nop,
+                Inst::Nop,
+                Inst::Nop,
+            ],
+            0x01,
+            0xAE89,
+            ExecutionMode::M8X16,
+        )?;
+        rom.write_machine_code_expect(
+            &suffix_patch,
+            "code_byte:battle_suffix",
+            &crate::patch::tracked_rom::Expect::Bytes(&[0xA9, 0x5B, 0x99, 0x00, 0x00, 0xC8]),
+        );
         count += 1;
     }
 
-    count
+    Ok(count)
 }
 
 // ── Auto charset collection ──────────────────────────────────────
@@ -872,11 +919,7 @@ fn stat_level_chars() -> Vec<char> {
     KO_STAT_LEVELS
         .iter()
         .flat_map(|s| s.chars())
-        .filter(|ch| {
-            !ch.is_control()
-                && *ch != ' '
-                && !translation_json::is_fixed_encode_char(*ch)
-        })
+        .filter(|ch| !ch.is_control() && *ch != ' ' && !translation_json::is_fixed_encode_char(*ch))
         .collect()
 }
 
@@ -901,10 +944,7 @@ pub fn auto_collect_charset(translations_dir: &Path) -> Result<Vec<char>, String
 
     for source in &hardcoded_sources {
         for &ch in source {
-            if !ch.is_control()
-                && ch != ' '
-                && !translation_json::is_fixed_encode_char(ch)
-            {
+            if !ch.is_control() && ch != ' ' && !translation_json::is_fixed_encode_char(ch) {
                 freq.entry(ch).or_insert(0);
             }
         }

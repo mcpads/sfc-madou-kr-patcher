@@ -1,12 +1,16 @@
-//! 65816 ASM builder — mini assembler for hook code generation.
+//! Placement-aware W65C816 assembly adapter for hook code generation.
 //!
-//! Two-pass assembler with label-based branch resolution.
-//! Only supports the instruction subset used by ROM hooks.
+//! The project-local instruction vocabulary remains compact, while opcode
+//! selection, M/X widths, label placement, branch ranges, and final decoding
+//! are owned by `retro-typed-isa`'s complete `w65c816` profile.
 
-use std::collections::HashMap;
+use w65c816::{
+    AddressingMode, AssembledProgram, Assembler, CodeLocation, CpuMode, Instruction, Mnemonic,
+    Operand, Width, WidthState,
+};
 
 /// 65816 instruction (subset used by hooks).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Inst {
     /// REP #imm — C2 xx
@@ -149,322 +153,382 @@ pub enum Inst {
     LdyImm16(u16),
     /// MVN dst,src — 54 dst src (block move next)
     Mvn(u8, u8),
-    /// Raw bytes — variable size, for inline data or unsupported opcodes.
-    RawBytes(Vec<u8>),
     /// Pseudo-instruction: label definition (0 bytes).
     Label(&'static str),
 }
 
-/// Instruction byte size (Label is 0).
-#[allow(dead_code)]
-fn inst_size(inst: &Inst) -> usize {
-    match inst {
-        Inst::Rep(_) | Inst::Sep(_) => 2,
-        Inst::LdaDp(_) | Inst::LdaImm8(_) | Inst::StaDp(_) | Inst::CmpImm8(_) | Inst::CmpDp(_) => 2,
-        Inst::LdaDpIndirectLongY(_) | Inst::StzDp(_) => 2,
-        Inst::AdcImm8(_) | Inst::SbcImm8(_) | Inst::SbcDp(_) | Inst::AdcDp(_) | Inst::EorImm8(_) | Inst::AndImm8(_) => 2,
-        Inst::IncDp(_) | Inst::DecDp(_) => 2,
-        Inst::Beq(_)
-        | Inst::Bne(_)
-        | Inst::Bmi(_)
-        | Inst::Bpl(_)
-        | Inst::Bcs(_)
-        | Inst::Bcc(_)
-        | Inst::Bra(_) => 2,
-        Inst::LdaImm16(_) | Inst::LdaAbs(_) | Inst::CmpImm16(_) | Inst::AndImm16(_) => 3,
-        Inst::AdcImm16(_) | Inst::SbcImm16(_) => 3,
-        Inst::StaAbs(_) | Inst::IncAbs(_) | Inst::StzAbs(_) => 3,
-        Inst::LdaAbsX(_) | Inst::StaAbsX(_) | Inst::StaAbsY(_) | Inst::LdaAbsY(_) => 3,
-        Inst::LdxImm16(_) | Inst::LdyImm16(_) | Inst::Mvn(_, _) => 3,
-        Inst::JmpAbs(_) => 3,
-        Inst::Jsl(_) | Inst::Jml(_) | Inst::StaLong(_) | Inst::StaLongX(_) | Inst::LdaLong(_) => 4,
-        Inst::Xba | Inst::IncA => 1,
-        Inst::Rtl | Inst::Php | Inst::Plp | Inst::Pha | Inst::Pla => 1,
-        Inst::Phb | Inst::Plb => 1,
-        Inst::Inx | Inst::Iny | Inst::Tay | Inst::Tya => 1,
-        Inst::Phx
-        | Inst::Plx
-        | Inst::Phy
-        | Inst::Ply
-        | Inst::DecA
-        | Inst::AslA
-        | Inst::Clc
-        | Inst::Sec => 1,
-        Inst::Sei | Inst::Cli | Inst::Nop => 1,
-        Inst::RawBytes(data) => data.len(),
-        Inst::Label(_) => 0,
+/// Native-mode accumulator/index widths at hook entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum ExecutionMode {
+    M8X8,
+    M8X16,
+    M16X8,
+    M16X16,
+}
+
+impl ExecutionMode {
+    fn widths(self) -> WidthState {
+        match self {
+            Self::M8X8 => WidthState::M8_X8,
+            Self::M8X16 => WidthState::M8_X16,
+            Self::M16X8 => WidthState::M16_X8,
+            Self::M16X16 => WidthState::M16_X16,
+        }
+    }
+
+    fn cpu_mode(self) -> CpuMode {
+        CpuMode::Native(self.widths())
+    }
+
+    pub(crate) fn profile_id(self) -> &'static str {
+        match self {
+            Self::M8X8 => "w65c816-native-m8-x8",
+            Self::M8X16 => "w65c816-native-m8-x16",
+            Self::M16X8 => "w65c816-native-m16-x8",
+            Self::M16X16 => "w65c816-native-m16-x16",
+        }
     }
 }
 
-/// Assemble a sequence of instructions into bytes.
-///
-/// Two-pass: first pass collects label offsets, second pass emits bytes.
-/// Branch targets are resolved automatically.
-#[allow(dead_code)]
+/// Typed W65C816 machine code retaining source, placement, and entry mode.
+#[derive(Debug, Clone)]
+pub struct MachineCode {
+    program: Vec<Inst>,
+    bank: u8,
+    addr: u16,
+    entry_mode: ExecutionMode,
+    assembled: AssembledProgram,
+}
+
+impl MachineCode {
+    pub fn bytes(&self) -> &[u8] {
+        self.assembled.bytes()
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub(crate) fn bank(&self) -> u8 {
+        self.bank
+    }
+
+    pub(crate) fn addr(&self) -> u16 {
+        self.addr
+    }
+
+    pub(crate) fn entry_mode(&self) -> ExecutionMode {
+        self.entry_mode
+    }
+
+    pub(crate) fn reassemble(&self) -> Result<AssembledProgram, String> {
+        assemble_program_at(&self.program, self.bank, self.addr, self.entry_mode)
+    }
+}
+
+/// Compile typed instructions while preserving their actual placement and mode.
+pub fn compile_machine_code(
+    program: Vec<Inst>,
+    bank: u8,
+    addr: u16,
+    entry_mode: ExecutionMode,
+) -> Result<MachineCode, String> {
+    let assembled = assemble_program_at(&program, bank, addr, entry_mode)?;
+    Ok(MachineCode {
+        program,
+        bank,
+        addr,
+        entry_mode,
+        assembled,
+    })
+}
+
+fn assemble_program_at(
+    program: &[Inst],
+    bank: u8,
+    addr: u16,
+    entry_mode: ExecutionMode,
+) -> Result<AssembledProgram, String> {
+    let mut assembler = Assembler::new();
+    let initial_mode = entry_mode.cpu_mode();
+    let mut widths = entry_mode.widths();
+    let mut branch_join = false;
+
+    for inst in program {
+        if matches!(inst, Inst::Label(_)) {
+            branch_join = true;
+        } else if branch_join && apply_immediate_width_requirement(&mut widths, inst) {
+            assembler.assume_mode(CpuMode::Native(widths));
+            branch_join = false;
+        }
+        emit_typed(&mut assembler, inst);
+        apply_status_width_change(&mut widths, inst);
+        if matches!(inst, Inst::Plp) {
+            widths = entry_mode.widths();
+            assembler.assume_mode(initial_mode);
+            branch_join = false;
+        }
+    }
+
+    assembler
+        .assemble(CodeLocation::new(bank, addr), initial_mode)
+        .map_err(|error| {
+            format!(
+                "W65C816 hook assembly failed @ ${bank:02X}:${addr:04X} ({entry_mode:?}): {error}"
+            )
+        })
+}
+
+/// Assemble typed instructions at their actual SNES placement and entry mode.
+#[cfg(test)]
+pub fn assemble_at(
+    program: &[Inst],
+    bank: u8,
+    addr: u16,
+    entry_mode: ExecutionMode,
+) -> Result<Vec<u8>, String> {
+    compile_machine_code(program.to_vec(), bank, addr, entry_mode)
+        .map(|machine_code| machine_code.bytes().to_vec())
+}
+
+/// Compile a fixed-size executable replacement and reject size drift.
+pub fn compile_fixed_machine_code<const N: usize>(
+    program: Vec<Inst>,
+    bank: u8,
+    addr: u16,
+    entry_mode: ExecutionMode,
+) -> Result<MachineCode, String> {
+    let machine_code = compile_machine_code(program, bank, addr, entry_mode)?;
+    if machine_code.len() != N {
+        return Err(format!(
+            "W65C816 replacement size mismatch @ ${bank:02X}:${addr:04X}: expected {N}, got {}",
+            machine_code.len()
+        ));
+    }
+    Ok(machine_code)
+}
+
+/// Compile a four-byte JSL replacement at its installation site.
+pub fn compile_jsl(
+    bank: u8,
+    addr: u16,
+    target: u32,
+    entry_mode: ExecutionMode,
+) -> Result<MachineCode, String> {
+    compile_fixed_machine_code::<4>(vec![Inst::Jsl(target)], bank, addr, entry_mode)
+}
+
+/// Test-only synthetic placement for instruction-level checks.
+#[cfg(test)]
 pub fn assemble(program: &[Inst]) -> Result<Vec<u8>, String> {
-    // Pass 1: collect label offsets
-    let mut labels: HashMap<&str, usize> = HashMap::new();
-    let mut offset = 0usize;
-    for inst in program {
-        if let Inst::Label(name) = inst {
-            if labels.contains_key(name) {
-                return Err(format!("duplicate label: \"{}\"", name));
-            }
-            labels.insert(name, offset);
+    let mut outputs = Vec::new();
+    let mut errors = Vec::new();
+    for mode in [
+        ExecutionMode::M8X8,
+        ExecutionMode::M8X16,
+        ExecutionMode::M16X8,
+        ExecutionMode::M16X16,
+    ] {
+        match assemble_at(program, 0x00, 0x8000, mode) {
+            Ok(bytes) => outputs.push(bytes),
+            Err(error) => errors.push(error),
         }
-        offset += inst_size(inst);
     }
+    let Some(expected) = outputs.first() else {
+        return Err(errors.join("; "));
+    };
+    if outputs.iter().any(|bytes| bytes != expected) {
+        return Err("synthetic assembly depends on entry M/X mode".to_string());
+    }
+    Ok(expected.clone())
+}
 
-    // Pass 2: emit bytes
-    let mut out = Vec::with_capacity(offset);
-    let mut pc = 0usize;
-    for inst in program {
-        match inst {
-            Inst::Rep(v) => {
-                out.push(0xC2);
-                out.push(*v);
-            }
-            Inst::Sep(v) => {
-                out.push(0xE2);
-                out.push(*v);
-            }
-            Inst::LdaDp(v) => {
-                out.push(0xA5);
-                out.push(*v);
-            }
-            Inst::LdaImm8(v) => {
-                out.push(0xA9);
-                out.push(*v);
-            }
-            Inst::LdaImm16(v) => {
-                out.push(0xA9);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::StaDp(v) => {
-                out.push(0x85);
-                out.push(*v);
-            }
-            Inst::CmpImm8(v) => {
-                out.push(0xC9);
-                out.push(*v);
-            }
-            Inst::CmpDp(dp) => {
-                out.push(0xC5);
-                out.push(*dp);
-            }
-            Inst::LdaDpIndirectLongY(dp) => {
-                out.push(0xB7);
-                out.push(*dp);
-            }
-            Inst::StzDp(dp) => {
-                out.push(0x64);
-                out.push(*dp);
-            }
-            Inst::CmpImm16(v) => {
-                out.push(0xC9);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::AndImm16(v) => {
-                out.push(0x29);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::LdaAbs(addr) => {
-                out.push(0xAD);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::IncDp(v) => {
-                out.push(0xE6);
-                out.push(*v);
-            }
-            Inst::DecDp(v) => {
-                out.push(0xC6);
-                out.push(*v);
-            }
-            Inst::Beq(label)
-            | Inst::Bne(label)
-            | Inst::Bmi(label)
-            | Inst::Bpl(label)
-            | Inst::Bcs(label)
-            | Inst::Bcc(label)
-            | Inst::Bra(label) => {
-                let target = labels
-                    .get(label)
-                    .ok_or_else(|| format!("undefined label: \"{}\"", label))?;
-                let next_pc = pc + 2;
-                let rel = (*target as isize) - (next_pc as isize);
-                if !(-128..=127).contains(&rel) {
-                    return Err(format!(
-                        "branch to \"{}\" out of range: {} (must be -128..127)",
-                        label, rel
-                    ));
-                }
-                let opcode = match inst {
-                    Inst::Beq(_) => 0xF0,
-                    Inst::Bne(_) => 0xD0,
-                    Inst::Bmi(_) => 0x30,
-                    Inst::Bpl(_) => 0x10,
-                    Inst::Bcs(_) => 0xB0,
-                    Inst::Bcc(_) => 0x90,
-                    Inst::Bra(_) => 0x80,
-                    _ => unreachable!(),
-                };
-                out.push(opcode);
-                out.push(rel as u8);
-            }
-            Inst::StaAbs(addr) => {
-                out.push(0x8D);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::IncAbs(addr) => {
-                out.push(0xEE);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::StzAbs(addr) => {
-                out.push(0x9C);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::Jsl(addr) => {
-                out.push(0x22);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-                out.push((*addr >> 16) as u8);
-            }
-            Inst::Jml(addr) => {
-                out.push(0x5C);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-                out.push((*addr >> 16) as u8);
-            }
-            Inst::Rtl => out.push(0x6B),
-            Inst::Php => out.push(0x08),
-            Inst::Plp => out.push(0x28),
-            Inst::Pha => out.push(0x48),
-            Inst::Pla => out.push(0x68),
-            Inst::Phb => out.push(0x8B),
-            Inst::Plb => out.push(0xAB),
-            Inst::Inx => out.push(0xE8),
-            Inst::Iny => out.push(0xC8),
-            Inst::Tay => out.push(0xA8),
-            Inst::Tya => out.push(0x98),
-            Inst::Phx => out.push(0xDA),
-            Inst::Plx => out.push(0xFA),
-            Inst::Phy => out.push(0x5A),
-            Inst::Ply => out.push(0x7A),
-            Inst::DecA => out.push(0x3A),
-            Inst::AslA => out.push(0x0A),
-            Inst::Clc => out.push(0x18),
-            Inst::Sec => out.push(0x38),
-            Inst::AdcImm8(v) => {
-                out.push(0x69);
-                out.push(*v);
-            }
-            Inst::AdcImm16(v) => {
-                out.push(0x69);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::SbcImm8(v) => {
-                out.push(0xE9);
-                out.push(*v);
-            }
-            Inst::SbcImm16(v) => {
-                out.push(0xE9);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::SbcDp(dp) => {
-                out.push(0xE5);
-                out.push(*dp);
-            }
-            Inst::AdcDp(dp) => {
-                out.push(0x65);
-                out.push(*dp);
-            }
-            Inst::EorImm8(v) => {
-                out.push(0x49);
-                out.push(*v);
-            }
-            Inst::AndImm8(v) => {
-                out.push(0x29);
-                out.push(*v);
-            }
-            Inst::LdaAbsX(addr) => {
-                out.push(0xBD);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::StaAbsX(addr) => {
-                out.push(0x9D);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::StaAbsY(addr) => {
-                out.push(0x99);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::LdaAbsY(addr) => {
-                out.push(0xB9);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::StaLong(addr) => {
-                out.push(0x8F);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-                out.push((*addr >> 16) as u8);
-            }
-            Inst::StaLongX(addr) => {
-                out.push(0x9F);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-                out.push((*addr >> 16) as u8);
-            }
-            Inst::Xba => out.push(0xEB),
-            Inst::IncA => out.push(0x1A),
-            Inst::JmpAbs(addr) => {
-                out.push(0x4C);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-            }
-            Inst::LdaLong(addr) => {
-                out.push(0xAF);
-                out.push(*addr as u8);
-                out.push((*addr >> 8) as u8);
-                out.push((*addr >> 16) as u8);
-            }
-            Inst::LdxImm16(v) => {
-                out.push(0xA2);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::LdyImm16(v) => {
-                out.push(0xA0);
-                out.push(*v as u8);
-                out.push((*v >> 8) as u8);
-            }
-            Inst::Mvn(dst, src) => {
-                out.push(0x54);
-                out.push(*dst);
-                out.push(*src);
-            }
-            Inst::Sei => out.push(0x78),
-            Inst::Cli => out.push(0x58),
-            Inst::Nop => out.push(0xEA),
-            Inst::RawBytes(data) => out.extend_from_slice(data),
-            Inst::Label(_) => {}
+fn apply_immediate_width_requirement(widths: &mut WidthState, inst: &Inst) -> bool {
+    use Inst::*;
+    match inst {
+        LdaImm8(_) | CmpImm8(_) | AdcImm8(_) | SbcImm8(_) | EorImm8(_) | AndImm8(_) => {
+            widths.accumulator = Width::Eight;
+            true
         }
-        pc += inst_size(inst);
+        LdaImm16(_) | CmpImm16(_) | AndImm16(_) | AdcImm16(_) | SbcImm16(_) => {
+            widths.accumulator = Width::Sixteen;
+            true
+        }
+        LdxImm16(_) | LdyImm16(_) => {
+            widths.index = Width::Sixteen;
+            true
+        }
+        _ => false,
     }
+}
 
-    Ok(out)
+fn apply_status_width_change(widths: &mut WidthState, inst: &Inst) {
+    let (width, mask) = match inst {
+        Inst::Rep(mask) => (Width::Sixteen, *mask),
+        Inst::Sep(mask) => (Width::Eight, *mask),
+        _ => return,
+    };
+    if mask & 0x20 != 0 {
+        widths.accumulator = width;
+    }
+    if mask & 0x10 != 0 {
+        widths.index = width;
+    }
+}
+
+fn emit_typed(assembler: &mut Assembler, inst: &Inst) {
+    use AddressingMode as Mode;
+    use Inst::*;
+    use Mnemonic as Mn;
+
+    let emit = |assembler: &mut Assembler, mnemonic, mode, operand| {
+        assembler.emit(Instruction::new(mnemonic, mode, operand));
+    };
+    let implied = |assembler: &mut Assembler, mnemonic| {
+        assembler.emit(Instruction::new(mnemonic, Mode::Implied, Operand::None));
+    };
+    let accumulator = |assembler: &mut Assembler, mnemonic| {
+        assembler.emit(Instruction::new(mnemonic, Mode::Accumulator, Operand::None));
+    };
+
+    match inst {
+        Label(name) => {
+            assembler.label(*name);
+        }
+        Beq(label) => {
+            assembler.emit_label_ref(Mn::Beq, Mode::Relative8, *label);
+        }
+        Bne(label) => {
+            assembler.emit_label_ref(Mn::Bne, Mode::Relative8, *label);
+        }
+        Bmi(label) => {
+            assembler.emit_label_ref(Mn::Bmi, Mode::Relative8, *label);
+        }
+        Bpl(label) => {
+            assembler.emit_label_ref(Mn::Bpl, Mode::Relative8, *label);
+        }
+        Bcs(label) => {
+            assembler.emit_label_ref(Mn::Bcs, Mode::Relative8, *label);
+        }
+        Bcc(label) => {
+            assembler.emit_label_ref(Mn::Bcc, Mode::Relative8, *label);
+        }
+        Bra(label) => {
+            assembler.emit_label_ref(Mn::Bra, Mode::Relative8, *label);
+        }
+        Rep(value) => emit(
+            assembler,
+            Mn::Rep,
+            Mode::ImmediateByte,
+            Operand::Byte(*value),
+        ),
+        Sep(value) => emit(
+            assembler,
+            Mn::Sep,
+            Mode::ImmediateByte,
+            Operand::Byte(*value),
+        ),
+        LdaDp(value) => emit(assembler, Mn::Lda, Mode::DirectPage, Operand::Byte(*value)),
+        LdaImm8(value) => emit(assembler, Mn::Lda, Mode::Immediate, Operand::Byte(*value)),
+        LdaImm16(value) => emit(assembler, Mn::Lda, Mode::Immediate, Operand::Word(*value)),
+        LdaAbs(value) => emit(assembler, Mn::Lda, Mode::Absolute, Operand::Word(*value)),
+        StaDp(value) => emit(assembler, Mn::Sta, Mode::DirectPage, Operand::Byte(*value)),
+        StaAbs(value) => emit(assembler, Mn::Sta, Mode::Absolute, Operand::Word(*value)),
+        CmpImm8(value) => emit(assembler, Mn::Cmp, Mode::Immediate, Operand::Byte(*value)),
+        CmpImm16(value) => emit(assembler, Mn::Cmp, Mode::Immediate, Operand::Word(*value)),
+        CmpDp(value) => emit(assembler, Mn::Cmp, Mode::DirectPage, Operand::Byte(*value)),
+        LdaDpIndirectLongY(value) => emit(
+            assembler,
+            Mn::Lda,
+            Mode::DirectPageIndirectLongIndexedY,
+            Operand::Byte(*value),
+        ),
+        StzDp(value) => emit(assembler, Mn::Stz, Mode::DirectPage, Operand::Byte(*value)),
+        AndImm16(value) => emit(assembler, Mn::And, Mode::Immediate, Operand::Word(*value)),
+        IncDp(value) => emit(assembler, Mn::Inc, Mode::DirectPage, Operand::Byte(*value)),
+        IncAbs(value) => emit(assembler, Mn::Inc, Mode::Absolute, Operand::Word(*value)),
+        StzAbs(value) => emit(assembler, Mn::Stz, Mode::Absolute, Operand::Word(*value)),
+        DecDp(value) => emit(assembler, Mn::Dec, Mode::DirectPage, Operand::Byte(*value)),
+        AdcImm8(value) => emit(assembler, Mn::Adc, Mode::Immediate, Operand::Byte(*value)),
+        AdcImm16(value) => emit(assembler, Mn::Adc, Mode::Immediate, Operand::Word(*value)),
+        SbcImm8(value) => emit(assembler, Mn::Sbc, Mode::Immediate, Operand::Byte(*value)),
+        SbcImm16(value) => emit(assembler, Mn::Sbc, Mode::Immediate, Operand::Word(*value)),
+        SbcDp(value) => emit(assembler, Mn::Sbc, Mode::DirectPage, Operand::Byte(*value)),
+        AdcDp(value) => emit(assembler, Mn::Adc, Mode::DirectPage, Operand::Byte(*value)),
+        EorImm8(value) => emit(assembler, Mn::Eor, Mode::Immediate, Operand::Byte(*value)),
+        AndImm8(value) => emit(assembler, Mn::And, Mode::Immediate, Operand::Byte(*value)),
+        LdaAbsX(value) => emit(assembler, Mn::Lda, Mode::AbsoluteX, Operand::Word(*value)),
+        StaAbsX(value) => emit(assembler, Mn::Sta, Mode::AbsoluteX, Operand::Word(*value)),
+        StaAbsY(value) => emit(assembler, Mn::Sta, Mode::AbsoluteY, Operand::Word(*value)),
+        LdaAbsY(value) => emit(assembler, Mn::Lda, Mode::AbsoluteY, Operand::Word(*value)),
+        StaLong(value) => emit(
+            assembler,
+            Mn::Sta,
+            Mode::AbsoluteLong,
+            Operand::Long(*value),
+        ),
+        StaLongX(value) => emit(
+            assembler,
+            Mn::Sta,
+            Mode::AbsoluteLongX,
+            Operand::Long(*value),
+        ),
+        LdaLong(value) => emit(
+            assembler,
+            Mn::Lda,
+            Mode::AbsoluteLong,
+            Operand::Long(*value),
+        ),
+        Jsl(value) => emit(
+            assembler,
+            Mn::Jsl,
+            Mode::AbsoluteLong,
+            Operand::Long(*value),
+        ),
+        Jml(value) => emit(
+            assembler,
+            Mn::Jml,
+            Mode::AbsoluteLong,
+            Operand::Long(*value),
+        ),
+        JmpAbs(value) => emit(assembler, Mn::Jmp, Mode::Absolute, Operand::Word(*value)),
+        LdxImm16(value) => emit(assembler, Mn::Ldx, Mode::Immediate, Operand::Word(*value)),
+        LdyImm16(value) => emit(assembler, Mn::Ldy, Mode::Immediate, Operand::Word(*value)),
+        Mvn(dst, src) => emit(
+            assembler,
+            Mn::Mvn,
+            Mode::BlockMove,
+            Operand::BlockMove {
+                destination_bank: *dst,
+                source_bank: *src,
+            },
+        ),
+        DecA => accumulator(assembler, Mn::Dec),
+        AslA => accumulator(assembler, Mn::Asl),
+        IncA => accumulator(assembler, Mn::Inc),
+        Inx => implied(assembler, Mn::Inx),
+        Iny => implied(assembler, Mn::Iny),
+        Tay => implied(assembler, Mn::Tay),
+        Tya => implied(assembler, Mn::Tya),
+        Phb => implied(assembler, Mn::Phb),
+        Plb => implied(assembler, Mn::Plb),
+        Rtl => implied(assembler, Mn::Rtl),
+        Php => implied(assembler, Mn::Php),
+        Plp => implied(assembler, Mn::Plp),
+        Pha => implied(assembler, Mn::Pha),
+        Pla => implied(assembler, Mn::Pla),
+        Sei => implied(assembler, Mn::Sei),
+        Cli => implied(assembler, Mn::Cli),
+        Nop => implied(assembler, Mn::Nop),
+        Phx => implied(assembler, Mn::Phx),
+        Plx => implied(assembler, Mn::Plx),
+        Phy => implied(assembler, Mn::Phy),
+        Ply => implied(assembler, Mn::Ply),
+        Clc => implied(assembler, Mn::Clc),
+        Sec => implied(assembler, Mn::Sec),
+        Xba => implied(assembler, Mn::Xba),
+    };
 }
 
 #[cfg(test)]

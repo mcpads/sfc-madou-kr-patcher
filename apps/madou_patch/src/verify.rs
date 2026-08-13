@@ -18,7 +18,7 @@ pub fn verify_rom(rom: &[u8]) {
         );
 
         let strings = bank::extract_bank(rom, config);
-        let results = simulator::verify_all(&strings, config.box_lines);
+        let results = simulator::verify_all(&strings, config);
 
         let overflow_count = results.iter().filter(|r| r.overflow).count();
         total_strings += strings.len();
@@ -28,7 +28,7 @@ pub fn verify_rom(rom: &[u8]) {
             "  Strings: {}, Overflow: {} (box: {}w × {}h)",
             strings.len(),
             overflow_count,
-            crate::textbox::layout::BOX_WIDTH_TILES,
+            config.box_width_tiles,
             config.box_lines
         );
 

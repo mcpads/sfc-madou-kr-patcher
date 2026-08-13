@@ -10,20 +10,24 @@ fn tile_data_size_is_256() {
 #[test]
 fn hook_code_contains_three_jsl_lz() {
     let code = build_shop_hook_code(DATA_BANK, DATA_ADDR).unwrap();
-    let jsl_count = code
-        .windows(4)
-        .filter(|w| *w == JSL_LZ_BYTES)
-        .count();
-    assert_eq!(jsl_count, 3, "Expected 3× JSL $009440 (nameplate + non-shop + OBJ tile)");
+    let jsl_count = code.windows(4).filter(|w| *w == JSL_LZ_BYTES).count();
+    assert_eq!(
+        jsl_count, 3,
+        "Expected 3× JSL $009440 (nameplate + non-shop + OBJ tile)"
+    );
 }
 
 #[test]
 fn hook_code_starts_with_3byte_nameplate_guard() {
     let code = build_shop_hook_code(DATA_BANK, DATA_ADDR).unwrap();
     // 3 pairs of LDA dp + CMP imm8 + BNE, at offsets 0/6/12
-    for (i, &(dp, val)) in [(0x0B, NAMEPLATE_DP0B), (0x0C, NAMEPLATE_DP0C), (0x0D, NAMEPLATE_DP0D)]
-        .iter()
-        .enumerate()
+    for (i, &(dp, val)) in [
+        (0x0B, NAMEPLATE_DP0B),
+        (0x0C, NAMEPLATE_DP0C),
+        (0x0D, NAMEPLATE_DP0D),
+    ]
+    .iter()
+    .enumerate()
     {
         let off = i * 6;
         assert_eq!(code[off], 0xA5, "LDA dp at guard {}", i);
@@ -121,7 +125,10 @@ fn hook_code_contains_four_dma_triggers() {
         .windows(5)
         .filter(|w| w == &[0xA9, 0x40, 0x8D, 0x0B, 0x42])
         .count();
-    assert_eq!(trigger_count, 4, "Expected 4 DMA triggers (Ch6): speech + 료 + cookie + 매완");
+    assert_eq!(
+        trigger_count, 4,
+        "Expected 4 DMA triggers (Ch6): speech + 료 + cookie + 매완"
+    );
 }
 
 #[test]
@@ -196,7 +203,8 @@ fn data_does_not_overlap_equip_oam() {
     assert!(
         DATA_ADDR >= equip_end,
         "Shop data ${:04X} overlaps equip end ${:04X}",
-        DATA_ADDR, equip_end
+        DATA_ADDR,
+        equip_end
     );
 }
 
@@ -208,7 +216,8 @@ fn data_fits_in_bank() {
     assert!(
         end_addr <= 0x10000,
         "Data+code overflows Bank ${:02X}: end=${:04X}",
-        DATA_BANK, end_addr
+        DATA_BANK,
+        end_addr
     );
 }
 
@@ -224,7 +233,9 @@ fn all_vram_in_phase1_dma_range() {
         assert!(
             vram >= 0x4800 && end <= 0x6000,
             "{} VRAM ${:04X}-${:04X} outside Phase 1 range ($4800-$5FFF)",
-            name, vram, end,
+            name,
+            vram,
+            end,
         );
     }
 }
@@ -242,7 +253,10 @@ fn all_vram_not_overwritten_by_phase2() {
         assert!(
             end <= phase2_vram_start,
             "{} VRAM ${:04X}-${:04X} overlaps Phase 2 DMA at ${:04X}",
-            name, vram, end, phase2_vram_start,
+            name,
+            vram,
+            end,
+            phase2_vram_start,
         );
     }
 }
@@ -262,7 +276,8 @@ fn soldout4_no_overlap_with_speech() {
     assert!(
         SOLDOUT4_VRAM >= speech_end,
         "Sold-out 료 VRAM ${:04X} overlaps speech end ${:04X}",
-        SOLDOUT4_VRAM, speech_end,
+        SOLDOUT4_VRAM,
+        speech_end,
     );
 }
 
@@ -272,7 +287,8 @@ fn cookie_no_overlap_with_soldout4() {
     assert!(
         COOKIE_VRAM >= soldout4_end,
         "Cookie VRAM ${:04X} overlaps sold-out 진 end ${:04X}",
-        COOKIE_VRAM, soldout4_end,
+        COOKIE_VRAM,
+        soldout4_end,
     );
 }
 
@@ -282,6 +298,7 @@ fn soldout23_no_overlap_with_cookie() {
     assert!(
         SOLDOUT23_VRAM >= cookie_end,
         "Sold-out 매완 VRAM ${:04X} overlaps cookie end ${:04X}",
-        SOLDOUT23_VRAM, cookie_end,
+        SOLDOUT23_VRAM,
+        cookie_end,
     );
 }

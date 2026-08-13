@@ -1398,3 +1398,22 @@ fn dump_sky_tilemap_text_groups() {
         }
     }
 }
+#[test]
+fn constrained_menu_place_names_fill_their_tile_slots_exactly() {
+    assert_eq!(
+        super::MENU_SUKETOUDARA_HOME.chars().count(),
+        super::MENU_SUKETOUDARA_HOME_TILES
+    );
+    assert!(
+        "스케토우다라Jr의 집".chars().count() > super::MENU_SUKETOUDARA_HOME_TILES,
+        "canonical place name must not silently replace the 10-tile menu variant"
+    );
+    assert_eq!(
+        super::MENU_DEATH_VALLEY.chars().count(),
+        super::MENU_DEATH_VALLEY_TILES
+    );
+    assert!(
+        "죽음의 계곡".chars().count() > super::MENU_DEATH_VALLEY_TILES,
+        "canonical place name must not silently replace the 4-tile menu variant"
+    );
+}

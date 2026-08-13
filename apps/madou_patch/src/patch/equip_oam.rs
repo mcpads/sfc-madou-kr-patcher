@@ -1,4 +1,4 @@
-//! Equipment screen OAM sprite localization .
+//! Equipment screen OAM sprite localization (Issue P).
 //!
 //! Replaces JP OAM text sprites on the equipment/stat screen:
 //! - "そうび" → "장비" (3 × 8x8 4bpp tiles, 3rd blank)
@@ -50,10 +50,10 @@
 //! | パ ド   | $44E0 | 16x16 |
 
 use crate::font_gen;
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{compile_jsl, compile_machine_code, ExecutionMode, Inst, MachineCode};
 use crate::patch::hook_common::JSL_LZ_BYTES;
 use crate::patch::tracked_rom::{Expect, TrackedRom};
-use crate::rom::lorom_to_pc;
+use crate::rom::{lorom_to_pc, pc_to_lorom};
 
 // ── Bank / address constants ─────────────────────────────────────
 
@@ -210,7 +210,11 @@ fn build_equip_tile_data(ttf_data: &[u8], ttf_size: f32) -> Result<Vec<u8>, Stri
 /// Uses DMA Channel 6 to copy KO tile data directly from ROM to VRAM.
 /// The screen is in force blank during pause menu initialization, so direct
 /// VRAM writes via DMA are safe.
-fn build_equip_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, String> {
+fn build_equip_hook_code_at(
+    data_bank: u8,
+    data_base: u16,
+    code_addr: u16,
+) -> Result<MachineCode, String> {
     use Inst::*;
 
     let mut program = vec![
@@ -254,12 +258,18 @@ fn build_equip_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, Strin
     program.push(Plp);
     program.push(Rtl);
 
-    assemble(&program)
+    compile_machine_code(program, data_bank, code_addr, ExecutionMode::M8X16)
+}
+
+#[cfg(test)]
+fn build_equip_hook_code(data_bank: u8, data_base: u16) -> Result<Vec<u8>, String> {
+    build_equip_hook_code_at(data_bank, data_base, data_base + TILE_DATA_SIZE as u16)
+        .map(|code| code.bytes().to_vec())
 }
 
 // ── Public API ───────────────────────────────────────────────────
 
-/// Apply equipment OAM sprite hook .
+/// Apply equipment OAM sprite hook (Issue P).
 ///
 /// Replaces そうび (장비) and 10 equipment names using ROM→VRAM direct
 /// DMA during pause menu initialization ($00:$83FF hook).
@@ -269,41 +279,29 @@ pub fn apply_equip_oam_hook(
     ttf_size: f32,
 ) -> Result<(), String> {
     let tile_data = build_equip_tile_data(ttf_data, ttf_size)?;
-    let hook_code = build_equip_hook_code(DATA_BANK, DATA_ADDR)?;
+    let code_snes = DATA_ADDR + tile_data.len() as u16;
+    let hook_code = build_equip_hook_code_at(DATA_BANK, DATA_ADDR, code_snes)?;
 
-    // Write tile data + hook code to Bank $25
+    // Write tile data and typed hook code as separate owners.
     let data_pc = lorom_to_pc(DATA_BANK, DATA_ADDR);
     let total_size = tile_data.len() + hook_code.len();
-    {
-        let mut r = rom.region_expect(
-            data_pc,
-            total_size,
-            "equip_oam:data+code",
-            &Expect::FreeSpace(0xFF),
-        );
-        r.copy_at(0, &tile_data);
-        r.copy_at(tile_data.len(), &hook_code);
-    }
+    rom.write_expect(
+        data_pc,
+        &tile_data,
+        "equip_oam:data",
+        &Expect::FreeSpace(0xFF),
+    );
+    rom.write_machine_code_expect(&hook_code, "equip_oam:code", &Expect::FreeSpace(0xFF));
 
     // Patch JSL $009440 site to jump to our hook
-    let code_snes = DATA_ADDR + tile_data.len() as u16;
     let hook_long = (DATA_BANK as u32) << 16 | code_snes as u32;
-    let jsl = [
-        0x22u8,
-        hook_long as u8,
-        (hook_long >> 8) as u8,
-        (hook_long >> 16) as u8,
-    ];
+    let site = pc_to_lorom(HOOK_SITE_PC);
+    let jsl = compile_jsl(site.bank, site.addr, hook_long, ExecutionMode::M8X16)?;
 
-    rom.write_expect(
-        HOOK_SITE_PC,
-        &jsl,
-        "equip_oam:hook",
-        &Expect::Bytes(&JSL_LZ_BYTES),
-    );
+    rom.write_machine_code_expect(&jsl, "equip_oam:hook", &Expect::Bytes(&JSL_LZ_BYTES));
 
     println!(
-        "  Equipment OAM : {}B tiles + {}B code @ ${:02X}:${:04X}-${:04X}",
+        "  Equipment OAM (Issue P): {}B tiles + {}B code @ ${:02X}:${:04X}-${:04X}",
         tile_data.len(),
         hook_code.len(),
         DATA_BANK,

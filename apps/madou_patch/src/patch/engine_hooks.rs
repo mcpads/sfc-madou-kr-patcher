@@ -9,7 +9,9 @@
 //!   1. Tilemap writer ($02:$AAC0) — adds FA→page $02, F0→page $03
 //!   2. Renderer ($02:$A9AA) — redirects page 2/3 tile loads to Bank $32
 
-use crate::patch::asm::{assemble, Inst};
+use crate::patch::asm::{
+    compile_fixed_machine_code, compile_machine_code, ExecutionMode, Inst, MachineCode,
+};
 use crate::patch::tracked_rom::{Expect, TrackedRom};
 use crate::rom::lorom_to_pc;
 
@@ -37,8 +39,6 @@ const FONT_TILE_BASE: u16 = 0x8000; // Font tile data base address in ROM bank
 const F0_TILE_OFFSET: u16 = 0xC000; // F0 prefix tiles at bank:$C000
 
 // ── Original ROM patch points ─────────────────────────────────────
-/// Tilemap writer: CMP #$FB / BEQ fb_path at $02:$AACB (4 bytes).
-const TILEMAP_HOOK_PC: usize = lorom_to_pc(0x02, 0xAACB);
 /// Renderer: TAY at $02:$A9AA (replaces TAY + loop setup + inner loop).
 const RENDERER_HOOK_PC: usize = lorom_to_pc(0x02, 0xA9AA);
 /// Renderer inner loop end: BNE at $02:$A9BD (fill to here with NOPs).
@@ -70,8 +70,6 @@ const RENDERER_POST_LOOP: u32 = 0x02_A9BF;
 //   2. FA table entry at $00:$CCD5: redirect to our FA prefix handler
 //   3. Bank check at $00:$CECD: override dp$0B from $0F to $32
 
-/// Char dispatch hook patch point: CMP #$F8 at $00:$CCA3 (7 bytes).
-const INGAME_DISPATCH_PC: usize = lorom_to_pc(0x00, 0xCCA3);
 /// Original normal char path (delay check): $00:$CCAA
 const INGAME_NORMAL_PATH: u32 = 0x00_CCAA;
 /// Original control code dispatch: $00:$CCE7
@@ -85,8 +83,6 @@ const INGAME_RENDER_ENTRY: u32 = 0x00_CE9E;
 #[allow(dead_code)]
 const FA_TABLE_ENTRY_PC: usize = lorom_to_pc(0x00, 0xCCD5);
 
-/// Bank override patch point: LDA #$0F / STA $0B at $00:$CECD (4 bytes).
-const BANK_OVERRIDE_PC: usize = lorom_to_pc(0x00, 0xCECD);
 /// Continue after bank setup: $00:$CED1
 const BANK_OVERRIDE_CONTINUE: u32 = 0x00_CED1;
 
@@ -109,11 +105,6 @@ const TEXT_POS_ADDR: u16 = 0x1186;
 //   1. Dispatch hook at $03:$8B9F: intercept F1/F0 before normal char path
 //   2. Bank check at $03:$8C3C: override dp$0B from $0F to $32
 
-/// Bank $03 dispatcher: CMP #$FC / BEQ / JMP at $03:$8B9F (7 bytes).
-const BANK03_DISPATCH_PC: usize = lorom_to_pc(0x03, 0x8B9F);
-/// Bank $03 bank override: LDA #$0F / STA $0B at $03:$8C3C (4 bytes).
-const BANK03_BANK_OVERRIDE_PC: usize = lorom_to_pc(0x03, 0x8C3C);
-
 /// FC page-break handler in Bank $03.
 const BANK03_FC_PATH: u32 = 0x03_8BBF;
 /// Normal (single-byte) char handler in Bank $03.
@@ -125,7 +116,7 @@ const BANK03_DMA_CALL: u32 = 0x03_8C40;
 
 // ── Block 0 VRAM clear hook ($03:$8CA0) ──────────────────────────
 //
-// the game's dynamic clear routine at $03:$8CA0 only
+// Issue A fix: the game's dynamic clear routine at $03:$8CA0 only
 // clears JP-specific tile positions using state table parameters
 // ($0006,X width, $0007,X rows, $001A,X VRAM offset). The F1/F0
 // hooks change tile consumption (JP 2→KR 1 per char), shifting all
@@ -136,8 +127,6 @@ const BANK03_DMA_CALL: u32 = 0x03_8C40;
 // at $03:$8E3E as DMA source. The original routine at $8CA0-$8CE3
 // becomes dead code after the JML.
 
-/// Block 0 clear hook patch point: start of dynamic clear at $03:$8CA0 (4 bytes for JML).
-const BLOCK0_CLEAR_HOOK_PC: usize = lorom_to_pc(0x03, 0x8CA0);
 /// Continue after hook: $03:$8CE4 (code after original clear routine).
 const BLOCK0_CLEAR_CONTINUE: u32 = 0x03_8CE4;
 /// DMA queue scheduler at $00:$8BF9.
@@ -161,7 +150,10 @@ const GAME_ZERO_BUF_ADDR: u16 = 0x8E3E;
 ///   F8/F9/FD/FE/FF → clear_and_dispatch (clear remaining VRAM tiles first)
 ///
 /// Entry: 8-bit A = char code (from dp$0B).
-fn build_ingame_dispatch_hook(clear_and_dispatch_addr: u32) -> Result<Vec<u8>, String> {
+fn build_ingame_dispatch_hook_at(
+    addr: u16,
+    clear_and_dispatch_addr: u32,
+) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // Check F0 prefix (tiles at Bank $32:$C000)
@@ -207,7 +199,8 @@ fn build_ingame_dispatch_hook(clear_and_dispatch_addr: u32) -> Result<Vec<u8>, S
         LdaDp(0x1E),              // LDA dp$1E (index byte)
         Jml(INGAME_RENDER_ENTRY), // JML $00:$CE9E
     ];
-    assemble(&program).map_err(|e| format!("ingame dispatch hook assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("ingame dispatch hook assembly failed: {}", e))
 }
 
 /// Generate the in-game FA prefix handler.
@@ -216,7 +209,7 @@ fn build_ingame_dispatch_hook(clear_and_dispatch_addr: u32) -> Result<Vec<u8>, S
 /// Mimics FB handler but uses Bank $32:$8000 (offset 0).
 ///
 /// Entry: dp$1E = index byte (pre-fetched at $00:$CC99).
-fn build_ingame_fa_handler() -> Result<Vec<u8>, String> {
+fn build_ingame_fa_handler_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         Rep(0x20),                // 16-bit A
@@ -229,7 +222,8 @@ fn build_ingame_fa_handler() -> Result<Vec<u8>, String> {
         LdaDp(0x1E),              // LDA dp$1E (index byte)
         Jml(INGAME_RENDER_ENTRY), // JML $00:$CE9E
     ];
-    assemble(&program).map_err(|e| format!("ingame FA handler assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("ingame FA handler assembly failed: {}", e))
 }
 
 /// Generate a bank check hook (shared pattern for in-game and Bank $03).
@@ -237,7 +231,11 @@ fn build_ingame_fa_handler() -> Result<Vec<u8>, String> {
 /// Checks `BANK_FLAG_ADDR` for exactly $32. If matched, uses Bank $32
 /// and clears the flag; otherwise falls through to default Bank $0F.
 /// The only difference between call sites is the JML continue address.
-fn build_bank_check_hook(continue_addr: u32, label: &str) -> Result<Vec<u8>, String> {
+fn build_bank_check_hook(
+    addr: u16,
+    continue_addr: u32,
+    label: &str,
+) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         LdaAbs(BANK_FLAG_ADDR), // LDA $1D70
@@ -253,14 +251,15 @@ fn build_bank_check_hook(continue_addr: u32, label: &str) -> Result<Vec<u8>, Str
         StzAbs(BANK_FLAG_ADDR), // STZ $1D70 (clear flag)
         Jml(continue_addr),     // JML continue
     ];
-    assemble(&program).map_err(|e| format!("{} assembly failed: {}", label, e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("{} assembly failed: {}", label, e))
 }
 
 /// Generate the in-game bank override hook.
 ///
 /// Replaces LDA #$0F / STA $0B at $00:$CECD (exactly 4 bytes → JML).
-fn build_ingame_bank_check() -> Result<Vec<u8>, String> {
-    build_bank_check_hook(BANK_OVERRIDE_CONTINUE, "ingame bank check")
+fn build_ingame_bank_check_at(addr: u16) -> Result<MachineCode, String> {
+    build_bank_check_hook(addr, BANK_OVERRIDE_CONTINUE, "ingame bank check")
 }
 
 /// Generate the Bank $03 dispatch hook + F1/F0 prefix handlers.
@@ -274,7 +273,7 @@ fn build_ingame_bank_check() -> Result<Vec<u8>, String> {
 /// FB's INC×2 + JSR $8C2C path at $03:$8C02.
 ///
 /// Entry: 8-bit A = char code (from dispatcher at $03:$8B93).
-fn build_bank03_dispatch_hook() -> Result<Vec<u8>, String> {
+fn build_bank03_dispatch_hook_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // ── Dispatch (mirrors $03:$8B9F-$8BA5) ──
@@ -323,18 +322,19 @@ fn build_bank03_dispatch_hook() -> Result<Vec<u8>, String> {
         Rep(0x20),              // 16-bit (INC $000B,X at $8C02 needs M=0)
         Jml(BANK03_FB_ADVANCE), // → $03:$8C02 (INC×2 + JSR $8C2C)
     ];
-    assemble(&program).map_err(|e| format!("bank03 dispatch hook assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("bank03 dispatch hook assembly failed: {}", e))
 }
 
 /// Generate the Bank $03 bank check hook.
 ///
 /// Replaces LDA #$0F / STA $0B at $03:$8C3C (exactly 4 bytes → JML).
 /// Entry: 8-bit A, inside tile renderer subroutine ($03:$8C2C).
-fn build_bank03_bank_check() -> Result<Vec<u8>, String> {
-    build_bank_check_hook(BANK03_DMA_CALL, "bank03 bank check")
+fn build_bank03_bank_check_at(addr: u16) -> Result<MachineCode, String> {
+    build_bank_check_hook(addr, BANK03_DMA_CALL, "bank03 bank check")
 }
 
-/// Generate the Block 0 VRAM clear hook .
+/// Generate the Block 0 VRAM clear hook (Issue A fix).
 ///
 /// Replaces the game's dynamic clear routine at $03:$8CA0 (JML, 4 bytes).
 /// The original routine uses state table parameters to clear only JP-specific
@@ -343,7 +343,7 @@ fn build_bank03_bank_check() -> Result<Vec<u8>, String> {
 ///
 /// Entry: M=8, X = state table index (preserved via PHX/PLX).
 /// Exit: JML $03:$8CE4 (code after original clear routine).
-fn build_block0_clear_hook() -> Result<Vec<u8>, String> {
+fn build_block0_clear_hook_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // === Guard: skip if game says no clear ($0007,X == 0) ===
@@ -385,7 +385,8 @@ fn build_block0_clear_hook() -> Result<Vec<u8>, String> {
         Plx,
         Jml(BLOCK0_CLEAR_CONTINUE), // JML $03:$8CE4
     ];
-    assemble(&program).map_err(|e| format!("block0 clear hook assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("block0 clear hook assembly failed: {}", e))
 }
 
 /// Unused RAM byte for slot temp storage during VRAM clear.
@@ -412,7 +413,7 @@ const SLOT_TEMP_ADDR: u16 = 0x1D72;
 /// Entry: 8-bit M, A = control code (F8/F9/FD/FE/FF).
 ///        X = text state table index. $0007,X = current slot (0-29).
 /// Exit: JML $00:$CCE7 (original control code dispatch).
-fn build_clear_and_dispatch() -> Result<Vec<u8>, String> {
+fn build_clear_and_dispatch_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // === Save registers ===
@@ -541,7 +542,8 @@ fn build_clear_and_dispatch() -> Result<Vec<u8>, String> {
         Pla,             // restore control code
         Jml(INGAME_CONTROL_DISPATCH),
     ];
-    assemble(&program).map_err(|e| format!("clear_and_dispatch assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("clear_and_dispatch assembly failed: {}", e))
 }
 
 // ── Blank tile fix ($02:$AA92) ───────────────────────────────────
@@ -554,16 +556,13 @@ fn build_clear_and_dispatch() -> Result<Vec<u8>, String> {
 // Fix: change the blank tile value from $01F4 to $0000.
 // Tile $00 page $00 = fixed-encode tile $00 = blank in both JP/KO.
 
-/// Blank tile init: LDA #$01F4 at $02:$AA92 (3 bytes: A9 F4 01).
-const BLANK_TILE_PC: usize = lorom_to_pc(0x02, 0xAA92);
-
 /// Generate the tilemap writer hook.
 ///
 /// Replaces `CMP #$FB / BEQ fb_path` at $02:$AACB.
 /// Dispatches: FB→original, F1→page $02, F0→page $03, other→single.
 ///
 /// Entry: 8-bit A = char byte. X = source buffer index, Y = dest index.
-fn build_tilemap_hook() -> Result<Vec<u8>, String> {
+fn build_tilemap_hook_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // Check FB (original behavior)
@@ -598,7 +597,8 @@ fn build_tilemap_hook() -> Result<Vec<u8>, String> {
         StaAbsY(0x000B), // STA $000B,Y
         Jml(TILEMAP_NEXT),
     ];
-    assemble(&program).map_err(|e| format!("tilemap hook assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M8X16)
+        .map_err(|e| format!("tilemap hook assembly failed: {}", e))
 }
 
 /// Generate the renderer hook.
@@ -609,7 +609,7 @@ fn build_tilemap_hook() -> Result<Vec<u8>, String> {
 ///
 /// Entry: 16-bit A = tile offset (after ASL×6). X = WRAM dest offset.
 /// DB = $0F.
-fn build_renderer_hook() -> Result<Vec<u8>, String> {
+fn build_renderer_hook_at(addr: u16) -> Result<MachineCode, String> {
     use Inst::*;
     let program = vec![
         // A = tile offset from ASL×6
@@ -653,12 +653,62 @@ fn build_renderer_hook() -> Result<Vec<u8>, String> {
         Plb, // restore DB = $0F
         Jml(RENDERER_POST_LOOP),
     ];
-    assemble(&program).map_err(|e| format!("renderer hook assembly failed: {}", e))
+    compile_machine_code(program, HOOK_BANK, addr, ExecutionMode::M16X16)
+        .map_err(|e| format!("renderer hook assembly failed: {}", e))
 }
 
-/// Helper: build a 4-byte JML instruction for a 24-bit SNES address.
-fn jml_bytes(addr: u32) -> [u8; 4] {
-    [0x5C, addr as u8, (addr >> 8) as u8, (addr >> 16) as u8]
+#[cfg(test)]
+fn build_tilemap_hook() -> Result<Vec<u8>, String> {
+    build_tilemap_hook_at(0xD000).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_renderer_hook() -> Result<Vec<u8>, String> {
+    build_renderer_hook_at(0xD100).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_clear_and_dispatch() -> Result<Vec<u8>, String> {
+    build_clear_and_dispatch_at(0xD200).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_ingame_dispatch_hook(clear_and_dispatch_addr: u32) -> Result<Vec<u8>, String> {
+    build_ingame_dispatch_hook_at(0xD300, clear_and_dispatch_addr).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_ingame_fa_handler() -> Result<Vec<u8>, String> {
+    build_ingame_fa_handler_at(0xD400).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_ingame_bank_check() -> Result<Vec<u8>, String> {
+    build_ingame_bank_check_at(0xD500).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_bank03_dispatch_hook() -> Result<Vec<u8>, String> {
+    build_bank03_dispatch_hook_at(0xD600).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_bank03_bank_check() -> Result<Vec<u8>, String> {
+    build_bank03_bank_check_at(0xD700).map(|code| code.bytes().to_vec())
+}
+
+#[cfg(test)]
+fn build_block0_clear_hook() -> Result<Vec<u8>, String> {
+    build_block0_clear_hook_at(0xD800).map(|code| code.bytes().to_vec())
+}
+
+fn compile_jml(
+    bank: u8,
+    addr: u16,
+    target: u32,
+    mode: ExecutionMode,
+) -> Result<MachineCode, String> {
+    compile_fixed_machine_code::<4>(vec![Inst::Jml(target)], bank, addr, mode)
 }
 
 /// Apply engine hooks to the ROM.
@@ -672,49 +722,46 @@ fn jml_bytes(addr: u32) -> [u8; 4] {
 /// Returns the SNES address immediately after the last hook byte.
 pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> {
     // ── Build hook code (order matters: dispatch depends on clear_dispatch addr) ──
-    let tilemap_code = build_tilemap_hook()?;
-    let renderer_code = build_renderer_hook()?;
-    let clear_dispatch_code = build_clear_and_dispatch()?;
-
-    // Calculate addresses for hooks built so far to determine clear_dispatch_addr
     let mut next_addr = hook_base;
 
     let tilemap_addr = next_addr;
+    let tilemap_code = build_tilemap_hook_at(tilemap_addr)?;
     next_addr += tilemap_code.len() as u16;
 
     let renderer_addr = next_addr;
+    let renderer_code = build_renderer_hook_at(renderer_addr)?;
     next_addr += renderer_code.len() as u16;
 
     let clear_dispatch_addr = next_addr;
+    let clear_dispatch_code = build_clear_and_dispatch_at(clear_dispatch_addr)?;
     next_addr += clear_dispatch_code.len() as u16;
 
     // Now build dispatch hook with the known clear_dispatch address
     let clear_dispatch_long = ((HOOK_BANK as u32) << 16) | (clear_dispatch_addr as u32);
-    let dispatch_code = build_ingame_dispatch_hook(clear_dispatch_long)?;
-
     let dispatch_addr = next_addr;
+    let dispatch_code = build_ingame_dispatch_hook_at(dispatch_addr, clear_dispatch_long)?;
     next_addr += dispatch_code.len() as u16;
 
     // Build remaining hooks (no address dependencies)
-    let fa_handler_code = build_ingame_fa_handler()?;
     let fa_handler_addr = next_addr;
+    let fa_handler_code = build_ingame_fa_handler_at(fa_handler_addr)?;
     next_addr += fa_handler_code.len() as u16;
 
-    let bank_check_code = build_ingame_bank_check()?;
     let bank_check_addr = next_addr;
+    let bank_check_code = build_ingame_bank_check_at(bank_check_addr)?;
     next_addr += bank_check_code.len() as u16;
 
-    let bank03_dispatch_code = build_bank03_dispatch_hook()?;
     let bank03_dispatch_addr = next_addr;
+    let bank03_dispatch_code = build_bank03_dispatch_hook_at(bank03_dispatch_addr)?;
     next_addr += bank03_dispatch_code.len() as u16;
 
-    let bank03_bank_check_code = build_bank03_bank_check()?;
     let bank03_bank_check_addr = next_addr;
+    let bank03_bank_check_code = build_bank03_bank_check_at(bank03_bank_check_addr)?;
     next_addr += bank03_bank_check_code.len() as u16;
 
-    // Block 0 VRAM clear hook ($03:$8CA0)
-    let block0_clear_code = build_block0_clear_hook()?;
+    // Block 0 VRAM clear hook (Issue A fix — $03:$8CA0)
     let block0_clear_addr = next_addr;
+    let block0_clear_code = build_block0_clear_hook_at(block0_clear_addr)?;
     next_addr += block0_clear_code.len() as u16;
 
     let hooks_end = next_addr;
@@ -771,7 +818,7 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
         HOOK_BANK,
         bank03_bank_check_addr
     );
-    println!("  [Block 0 VRAM clear ($03:$8CA0)]");
+    println!("  [Block 0 VRAM clear (Issue A fix — $03:$8CA0)]");
     println!(
         "    Clear hook: {} bytes at ${:02X}:${:04X}",
         block0_clear_code.len(),
@@ -797,50 +844,43 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
         ));
     }
 
-    // ── Write all hook code to Bank $32 ──────────────────────────
-    let total_hook_bytes = (hooks_end - hook_base) as usize;
-    {
-        let hook_pc = lorom_to_pc(HOOK_BANK, hook_base);
-        let mut region = rom.region_expect(
-            hook_pc,
-            total_hook_bytes,
-            "engine:hook_code",
-            &Expect::FreeSpace(0xFF),
-        );
-        let chunks: &[(u16, &[u8])] = &[
-            (tilemap_addr, &tilemap_code),
-            (renderer_addr, &renderer_code),
-            (clear_dispatch_addr, &clear_dispatch_code),
-            (dispatch_addr, &dispatch_code),
-            (fa_handler_addr, &fa_handler_code),
-            (bank_check_addr, &bank_check_code),
-            (bank03_dispatch_addr, &bank03_dispatch_code),
-            (bank03_bank_check_addr, &bank03_bank_check_code),
-            (block0_clear_addr, &block0_clear_code),
-        ];
-        for &(addr, code) in chunks {
-            let offset = (addr - hook_base) as usize;
-            region.copy_at(offset, code);
-        }
+    // ── Write every typed hook as one independently verified owner ──
+    for (code, label) in [
+        (&tilemap_code, "engine:tilemap_code"),
+        (&renderer_code, "engine:renderer_code"),
+        (&clear_dispatch_code, "engine:clear_dispatch_code"),
+        (&dispatch_code, "engine:dispatch_code"),
+        (&fa_handler_code, "engine:fa_handler_code"),
+        (&bank_check_code, "engine:bank_check_code"),
+        (&bank03_dispatch_code, "engine:bank03_dispatch_code"),
+        (&bank03_bank_check_code, "engine:bank03_bank_check_code"),
+        (&block0_clear_code, "engine:block0_clear_code"),
+    ] {
+        rom.write_machine_code_expect(code, label, &Expect::FreeSpace(0xFF));
     }
 
     // ── Patch save-menu hooks ────────────────────────────────────
     // Blank tile fix: change LDA #$01F4 → LDA #$0000 at $02:$AA92
     // Original: A9 F4 01 → New: A9 00 00
     // FB $F4 tile has a Korean glyph; tile $00 page $00 is blank.
-    rom.write_expect(
-        BLANK_TILE_PC + 1,
-        &[0x00, 0x00],
+    let blank_tile = compile_fixed_machine_code::<3>(
+        vec![Inst::LdaImm16(0x0000)],
+        0x02,
+        0xAA92,
+        ExecutionMode::M16X16,
+    )?;
+    rom.write_machine_code_expect(
+        &blank_tile,
         "engine:blank_tile_fix",
-        &Expect::Bytes(&[0xF4, 0x01]),
+        &Expect::Bytes(&[0xA9, 0xF4, 0x01]),
     );
     println!("  Patched $02:$AA92: LDA #$01F4 → LDA #$0000 (blank tile fix)");
 
     // Tilemap writer: replace CMP #$FB / BEQ at $02:$AACB with JML
     let tilemap_long = ((HOOK_BANK as u32) << 16) | (tilemap_addr as u32);
-    rom.write_expect(
-        TILEMAP_HOOK_PC,
-        &jml_bytes(tilemap_long),
+    let tilemap_jump = compile_jml(0x02, 0xAACB, tilemap_long, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
+        &tilemap_jump,
         "engine:tilemap_jml",
         &Expect::Bytes(&[0xC9, 0xFB]),
     );
@@ -850,14 +890,10 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
     let renderer_long = ((HOOK_BANK as u32) << 16) | (renderer_addr as u32);
     {
         let total = RENDERER_LOOP_END_PC - RENDERER_HOOK_PC;
-        let mut r = rom.region_expect(
-            RENDERER_HOOK_PC,
-            total,
-            "engine:renderer_jml",
-            &Expect::Bytes(&[0xA8]),
-        );
-        r.copy_at(0, &jml_bytes(renderer_long));
-        r.data_mut()[4..].fill(0xEA);
+        let mut program = vec![Inst::Jml(renderer_long)];
+        program.extend(std::iter::repeat_n(Inst::Nop, total - 4));
+        let replacement = compile_machine_code(program, 0x02, 0xA9AA, ExecutionMode::M16X16)?;
+        rom.write_machine_code_expect(&replacement, "engine:renderer_jml", &Expect::Bytes(&[0xA8]));
     }
     println!(
         "  Patched $02:$A9AA: JML ${:06X} (+{} NOP fill)",
@@ -869,14 +905,17 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
     // 1. Dispatch: replace CMP #$F8 / BCC / JMP at $00:$CCA3 (7 bytes)
     let dispatch_long = ((HOOK_BANK as u32) << 16) | (dispatch_addr as u32);
     {
-        let mut r = rom.region_expect(
-            INGAME_DISPATCH_PC,
-            7,
+        let replacement = compile_fixed_machine_code::<7>(
+            vec![Inst::Jml(dispatch_long), Inst::Nop, Inst::Nop, Inst::Nop],
+            0x00,
+            0xCCA3,
+            ExecutionMode::M8X16,
+        )?;
+        rom.write_machine_code_expect(
+            &replacement,
             "engine:ingame_dispatch_jml",
             &Expect::Bytes(&[0xC9, 0xF8]),
         );
-        r.copy_at(0, &jml_bytes(dispatch_long));
-        r.data_mut()[4..].fill(0xEA);
     }
     println!("  Patched $00:$CCA3: JML ${:06X} (+3 NOP)", dispatch_long);
 
@@ -889,9 +928,9 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
 
     // 3. Bank override: replace LDA #$0F / STA $0B at $00:$CECD (4 bytes)
     let bank_long = ((HOOK_BANK as u32) << 16) | (bank_check_addr as u32);
-    rom.write_expect(
-        BANK_OVERRIDE_PC,
-        &jml_bytes(bank_long),
+    let bank_jump = compile_jml(0x00, 0xCECD, bank_long, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
+        &bank_jump,
         "engine:bank_override_jml",
         &Expect::Bytes(&[0xA9, 0x0F, 0x85, 0x0B]),
     );
@@ -901,14 +940,22 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
     // 1. Dispatch: replace CMP #$FC / BEQ / JMP at $03:$8B9F (7 bytes)
     let bank03_dispatch_long = ((HOOK_BANK as u32) << 16) | (bank03_dispatch_addr as u32);
     {
-        let mut r = rom.region_expect(
-            BANK03_DISPATCH_PC,
-            7,
+        let replacement = compile_fixed_machine_code::<7>(
+            vec![
+                Inst::Jml(bank03_dispatch_long),
+                Inst::Nop,
+                Inst::Nop,
+                Inst::Nop,
+            ],
+            0x03,
+            0x8B9F,
+            ExecutionMode::M8X16,
+        )?;
+        rom.write_machine_code_expect(
+            &replacement,
             "engine:bank03_dispatch_jml",
             &Expect::Bytes(&[0xC9, 0xFC]),
         );
-        r.copy_at(0, &jml_bytes(bank03_dispatch_long));
-        r.data_mut()[4..].fill(0xEA);
     }
     println!(
         "  Patched $03:$8B9F: JML ${:06X} (+3 NOP)",
@@ -917,20 +964,20 @@ pub fn apply_hooks(rom: &mut TrackedRom, hook_base: u16) -> Result<u16, String> 
 
     // 2. Bank override: replace LDA #$0F / STA $0B at $03:$8C3C (4 bytes)
     let bank03_bank_long = ((HOOK_BANK as u32) << 16) | (bank03_bank_check_addr as u32);
-    rom.write_expect(
-        BANK03_BANK_OVERRIDE_PC,
-        &jml_bytes(bank03_bank_long),
+    let bank03_jump = compile_jml(0x03, 0x8C3C, bank03_bank_long, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
+        &bank03_jump,
         "engine:bank03_bank_override_jml",
         &Expect::Bytes(&[0xA9, 0x0F, 0x85, 0x0B]),
     );
     println!("  Patched $03:$8C3C: JML ${:06X}", bank03_bank_long);
 
-    // ── Patch Block 0 VRAM clear hook  ───────────────
+    // ── Patch Block 0 VRAM clear hook (Issue A fix) ───────────────
     // Dynamic clear at $03:$8CA0 (4 bytes → JML, rest is dead code)
     let block0_long = ((HOOK_BANK as u32) << 16) | (block0_clear_addr as u32);
-    rom.write_expect(
-        BLOCK0_CLEAR_HOOK_PC,
-        &jml_bytes(block0_long),
+    let block0_jump = compile_jml(0x03, 0x8CA0, block0_long, ExecutionMode::M8X16)?;
+    rom.write_machine_code_expect(
+        &block0_jump,
         "engine:block0_clear_jml",
         &Expect::Bytes(&[0xC2, 0x21, 0xBD, 0x1A]),
     );

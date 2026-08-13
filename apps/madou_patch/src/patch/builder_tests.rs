@@ -113,9 +113,10 @@ fn patch_code_byte_patches_encyclopedia() {
     }
     data[enc_pc + 55] = 0xFF;
     data[0x1B6EA..0x1B6F0].copy_from_slice(&[0x6B, 0x38, 0x3C, 0x57, 0x7C, 0xFF]);
+    data[0xAE89..0xAE8F].copy_from_slice(&[0xA9, 0x5B, 0x99, 0x00, 0x00, 0xC8]);
 
     let mut rom = TrackedRom::new(data);
-    let count = patch_code_byte_patches(&mut rom);
+    let count = patch_code_byte_patches(&mut rom).unwrap();
     assert_eq!(count, 3); // enc_desc + enc_name + battle_suffix
 
     // All C7 should be replaced with 0E
@@ -133,7 +134,7 @@ fn patch_code_byte_patches_encyclopedia() {
 #[test]
 fn patch_code_byte_patches_short_rom() {
     let mut rom = TrackedRom::new(vec![0x00u8; 0x100]);
-    let count = patch_code_byte_patches(&mut rom);
+    let count = patch_code_byte_patches(&mut rom).unwrap();
     assert_eq!(count, 0);
 }
 
@@ -143,7 +144,7 @@ fn patch_removes_battle_suffix() {
     // Plant JP code: LDA #$5B / STA $0000,Y / INY
     data[0xAE89..0xAE8F].copy_from_slice(&[0xA9, 0x5B, 0x99, 0x00, 0x00, 0xC8]);
     let mut rom = TrackedRom::new(data);
-    let count = patch_code_byte_patches(&mut rom);
+    let count = patch_code_byte_patches(&mut rom).unwrap();
     assert!(count >= 1);
     assert!(rom[0xAE89..0xAE8F].iter().all(|&b| b == 0xEA)); // NOP×6
 }

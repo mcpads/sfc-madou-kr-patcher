@@ -354,7 +354,7 @@ pub fn patch_fa_f0(rom: &mut TrackedRom, font_data: &[u8]) -> Result<usize, Stri
 //
 // JP ROM has 12 all-zero tile slots in the FB prefix range.  The game engine
 // references these indices for blank background tiles.  If our KO font fills
-// them with glyphs, those glyphs bleed into the game background .
+// them with glyphs, those glyphs bleed into the game background (Issue A).
 //
 // Fix: zero out the 12 FB positions in Bank $0F and copy the displaced KO
 // glyphs to F0 prefix positions in Bank $32 instead.
